@@ -1,5 +1,6 @@
 torch>=2.2
 torchaudio>=2.2
+torchcodec
 transformers>=4.40
 sentencepiece>=0.2
 encodec>=0.1.1
