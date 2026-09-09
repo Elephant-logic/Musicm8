@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: mini-suno-v2
+    runtime: python
+    region: frankfurt
+    plan: 2c-4g
+    buildCommand: bash render-build.sh
+    startCommand: uvicorn render_app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: MODEL_DEVICE
+        value: cpu
+      - key: MAX_SECONDS
+        value: "12"
+      - key: TORCH_NUM_THREADS
+        value: "2"
+      - key: JOB_RETENTION_HOURS
+        value: "24"
+      - key: MODEL_DIR
+        value: /var/data/models
+      - key: OUTPUT_DIR
+        value: /var/data/outputs
+      - key: MODEL_CHECKPOINT_PATH
+        value: /var/data/models/latest.pt
+      - key: SEMANTIC_CHECKPOINT_PATH
+        value: /var/data/models/semantic.pt
+      - key: HF_HOME
+        value: /var/data/huggingface
+      - key: TORCH_HOME
+        value: /var/data/torch
+      - key: API_KEY
+        generateValue: true
+      # Add MODEL_CHECKPOINT_URL in the Render dashboard after you have trained a checkpoint.
+      # For a private download URL, also add MODEL_DOWNLOAD_TOKEN.
+    disk:
+      name: mini-suno-data
+      mountPath: /var/data
+      sizeGB: 10
