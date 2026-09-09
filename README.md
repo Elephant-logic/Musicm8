@@ -1,64 +1,120 @@
 # Musicm8
 
-A Render-ready inference service for the mini-Suno V2 music model architecture.
+A small research stack for training and serving a Suno-style autoregressive music model.
 
-## What this repo does
+## Free GPU training
 
-- serves a trained music checkpoint with FastAPI
-- provides a browser UI at `/`
-- exposes queued generation jobs under `/api/jobs`
-- downloads `latest.pt` lazily from `MODEL_CHECKPOINT_URL`
-- caches model files on a Render persistent disk
-- supports prompt, BPM, key, lyrics, seed, CFG, top-k/top-p and temperature controls
-- protects generation with a generated `API_KEY`
+You do **not** need to pay for Render or rent a GPU just to start experimenting.
 
-> This deployment does **inference**, not training. You still need to train a compatible `latest.pt` checkpoint elsewhere.
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Elephant-logic/Musicm8/blob/main/notebooks/Musicm8_Colab.ipynb)
 
-## Deploy on Render
+[![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://www.kaggle.com/kernels/welcome?src=https://github.com/Elephant-logic/Musicm8/blob/main/notebooks/Musicm8_Kaggle.ipynb)
 
-1. In Render choose **New → Blueprint**.
-2. Connect this GitHub repository: `Elephant-logic/Musicm8`.
-3. Render will read `render.yaml` and create the service.
-4. After you have trained `latest.pt`, set `MODEL_CHECKPOINT_URL` in the Render service environment to a direct HTTPS download URL.
-5. Optionally set `MODEL_CHECKPOINT_SHA256` and `MODEL_DOWNLOAD_TOKEN`.
-6. Copy the generated `API_KEY` from Render and paste it into the Musicm8 web UI.
+Both notebooks:
 
-The Blueprint uses a CPU service and a persistent `/var/data` disk. The first generation can take longer while the checkpoint and pretrained codec/text models are downloaded.
+- clone the latest `Musicm8` code from this repo
+- verify that a CUDA GPU is available
+- install the model dependencies
+- build a training manifest from your audio when needed
+- tokenize audio with EnCodec
+- train the tiny model
+- save/resume `latest.pt`
+- generate a short WAV so you can hear whether training is working
 
-## Health and API
+Start with roughly 20–50 tracks you are authorized to use. The first milestone is simply to overfit a small dataset and produce recognizable short music.
 
-- `GET /health` — lightweight Render health check
-- `GET /api/status` — model/checkpoint status
-- `POST /api/warmup` — load the model ahead of the first generation
-- `POST /api/jobs` — queue generation
-- `GET /api/jobs/{id}` — poll a generation
-- `GET /api/jobs/{id}/audio` — fetch the WAV result
+### Colab
 
-Example request:
+1. Open the Colab badge above.
+2. Choose **Runtime → Change runtime type → GPU**.
+3. Put your audio in Google Drive at `MyDrive/Musicm8/audio/`.
+4. Run the notebook from top to bottom.
+5. Checkpoints and tokenized audio are stored in `MyDrive/Musicm8/work/`, so later sessions can resume.
+
+### Kaggle
+
+1. Open the Kaggle badge above.
+2. Enable a GPU accelerator in notebook settings.
+3. Attach a Kaggle Dataset containing your authorized training audio.
+4. Enable Internet for the notebook so it can clone this repo and download pretrained codec/text weights.
+5. Run all cells. Use **Save Version** / notebook outputs to keep `latest.pt` between sessions.
+
+GPU availability, accelerator type, quotas and session limits are controlled by Colab/Kaggle and can change.
+
+## Local training commands
+
+The notebooks automate these same steps:
 
 ```bash
-curl -X POST https://YOUR-SERVICE.onrender.com/api/jobs \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: YOUR_API_KEY' \
-  -d '{
-    "prompt":"dark atmospheric R&B with deep bass and wide synth pads",
-    "seconds":8,
-    "bpm":92,
-    "key":"F# minor",
-    "seed":42
-  }'
+pip install -r requirements.txt
+
+python tokenize_dataset.py \
+  --manifest data/manifest.jsonl \
+  --out data/tokens \
+  --codec encodec24 \
+  --channels 1 \
+  --clip-seconds 8 \
+  --stride-seconds 8 \
+  --keep-tail \
+  --device cuda
+
+python train.py \
+  --data data/tokens/index.jsonl \
+  --config configs/v2-tiny.json \
+  --out runs/tiny-overfit \
+  --batch-size 2 \
+  --grad-accum 2 \
+  --steps 2000 \
+  --device cuda
+
+python generate.py \
+  --checkpoint runs/tiny-overfit/latest.pt \
+  --prompt "dark atmospheric electronic music with deep bass" \
+  --seconds 8 \
+  --out sample.wav \
+  --device cuda
 ```
 
-## Required checkpoint format
+## Architecture
 
-The checkpoint is the output format used by mini-Suno V2 and must contain:
+The core path is:
+
+```text
+prompt / structured controls
+          │
+          ▼
+      text encoder
+          │
+          ▼
+previous codec tokens → causal Transformer
+          │
+          ▼
+delayed RVQ codebook predictions
+          │
+          ▼
+       audio codec
+          │
+          ▼
+          WAV
+```
+
+The model code also contains conditioning support for tempo, key, chords, sections, melody, energy, phonemes and semantic IDs, plus reference-audio context for continuation/infill experiments.
+
+## Optional web service
+
+The repository still contains `render_app.py` and `render.yaml` for serving a trained checkpoint through FastAPI. That path is optional. If you want to stay at £0, focus on the Colab/Kaggle notebooks first and keep the checkpoint in Drive/Kaggle outputs rather than deploying an always-on service.
+
+## Checkpoint format
+
+A Musicm8 checkpoint contains:
 
 - `model_config`
 - `model`
+- optimizer/scheduler state for resume
 - `data_meta.codec`
 
-`data_meta.codec` determines whether the service loads EnCodec 24 kHz, MusicGen EnCodec 32 kHz, DAC, or the optional custom music codec.
+`data_meta.codec` tells generation which neural codec produced the training tokens.
 
 ## Important
 
-Only train on audio you are authorized to use. Model weights and third-party pretrained components can have separate licenses from this code.
+Only train on audio you are authorized to use. Third-party pretrained components and model weights can have licenses separate from this repository.
