@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Musicm8</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif}body{margin:0;background:#0b0d10;color:#f5f7fa}main{width:min(850px,calc(100% - 28px));margin:36px auto}.card{background:#14181d;border:1px solid #2a3038;border-radius:18px;padding:24px}h1{font-size:clamp(34px,8vw,60px);margin:0 0 8px}p{color:#aeb6c2}label{display:block;margin:15px 0 7px;font-weight:700}textarea,input{width:100%;box-sizing:border-box;background:#0c1015;color:white;border:1px solid #303842;border-radius:10px;padding:12px;font:inherit}textarea{min-height:100px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:600px){.grid{grid-template-columns:1fr}}button{margin-top:20px;padding:13px 20px;border:0;border-radius:11px;font-weight:800;cursor:pointer}#status{margin-top:18px;padding:12px;background:#0c1015;border-radius:10px;white-space:pre-wrap}audio{width:100%;margin-top:18px}
+</style>
+</head><body><main><div class="card">
+<h1>Musicm8</h1><p>Your AI music model running on Render.</p>
+<label>API key</label><input id="api" type="password" placeholder="API_KEY from Render">
+<label>Music prompt</label><textarea id="prompt">dark atmospheric R&B with deep bass, wide synth pads and a strong chorus</textarea>
+<label>Lyrics (optional)</label><textarea id="lyrics" placeholder="Lyrics"></textarea>
+<div class="grid"><div><label>Seconds</label><input id="seconds" type="number" value="8" min="1" max="12"></div><div><label>Seed</label><input id="seed" type="number" value="42" min="0"></div><div><label>BPM</label><input id="bpm" type="number" placeholder="92"></div><div><label>Key</label><input id="key" placeholder="F# minor"></div></div>
+<button id="go">Generate music</button><div id="status">Checking service…</div><audio id="audio" controls hidden></audio>
+</div></main>
+<script>
+const $=id=>document.getElementById(id),status=$('status'),go=$('go'),audio=$('audio');
+const headers=()=>({'Content-Type':'application/json','X-API-Key':$('api').value});
+async function poll(id){for(;;){const r=await fetch('/api/jobs/'+id,{headers:headers()}),j=await r.json();if(!r.ok)throw Error(j.detail||'Job error');status.textContent=j.state+': '+j.progress+(j.error?'\n'+j.error:'');if(j.state==='done'){const a=await fetch(j.audio_url,{headers:{'X-API-Key':$('api').value}});if(!a.ok)throw Error('Could not fetch audio');audio.src=URL.createObjectURL(await a.blob());audio.hidden=false;return}if(j.state==='error')throw Error(j.error||'Generation failed');await new Promise(x=>setTimeout(x,1800))}}
+async function check(){try{const r=await fetch('/api/status'),j=await r.json();$('seconds').max=j.max_seconds;status.textContent='Online. Model loaded: '+j.runtime.loaded+'. Checkpoint configured: '+(j.runtime.checkpoint_present||j.runtime.checkpoint_url_configured)}catch(e){status.textContent='Status error: '+e}}
+go.onclick=async()=>{go.disabled=true;audio.hidden=true;try{const body={prompt:$('prompt').value,lyrics:$('lyrics').value,seconds:Number($('seconds').value),seed:Number($('seed').value||0),bpm:$('bpm').value?Number($('bpm').value):null,key:$('key').value||null};status.textContent='Submitting…';const r=await fetch('/api/jobs',{method:'POST',headers:headers(),body:JSON.stringify(body)}),j=await r.json();if(!r.ok)throw Error(j.detail||'Submit failed');await poll(j.id)}catch(e){status.textContent='Error: '+e.message}finally{go.disabled=false}};check();
+</script></body></html>
