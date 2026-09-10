@@ -1,120 +1,125 @@
 # Musicm8
 
-A small research stack for training and serving a Suno-style autoregressive music model.
+Musicm8 is now built around a **hybrid AI-producer / DAW workflow** rather than asking a tiny model to learn finished waveform audio from scratch.
 
-## Free GPU training
+The main path is:
 
-You do **not** need to pay for Render or rent a GPU just to start experimenting.
+```text
+training songs
+    ↓
+Demucs stem separation
+    ↓
+drums / bass / vocals / other
+    ↓
+BPM + key + beat/chord/pitch analysis
+    ↓
+editable MIDI: drums / bass / chords / melody
+    ↓
+small symbolic arrangement Transformer
+    ↓
+new multitrack MIDI arrangement
+    ↓
+SoundFont preview in Colab
+    ↓
+DAW + your VST instruments / effects / mix
+```
+
+This keeps the part that a small dataset can realistically teach — **rhythm, notes, arrangement and style patterns** — separate from instrument synthesis and mastering. The generated MIDI remains editable.
+
+## One-click Colab
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Elephant-logic/Musicm8/blob/main/notebooks/Musicm8_Colab.ipynb)
 
-[![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://www.kaggle.com/kernels/welcome?src=https://github.com/Elephant-logic/Musicm8/blob/main/notebooks/Musicm8_Kaggle.ipynb)
+1. Choose **Runtime → Change runtime type → GPU**.
+2. Put audio you are authorized to use in `MyDrive/Musicm8/audio/`.
+3. Run the large notebook cell.
+4. The first run separates each song with Demucs, analyzes it and builds MIDI. This is cached in Drive.
+5. A compact symbolic Transformer trains/resumes from the cached MIDI dataset.
+6. Musicm8 generates `arrangement.mid`, individual MIDI stems and a quick SoundFont preview.
+7. Import the MIDI into Ableton, FL Studio, Logic, Reaper or another DAW and assign your preferred VSTs.
 
-Both notebooks:
-
-- clone the latest `Musicm8` code from this repo
-- verify that a CUDA GPU is available
-- install the model dependencies
-- build a training manifest from your audio when needed
-- tokenize audio with EnCodec
-- train the tiny model
-- save/resume `latest.pt`
-- generate a short WAV so you can hear whether training is working
-
-Start with roughly 20–50 tracks you are authorized to use. The first milestone is simply to overfit a small dataset and produce recognizable short music.
-
-### Colab
-
-1. Open the Colab badge above.
-2. Choose **Runtime → Change runtime type → GPU**.
-3. Put your audio in Google Drive at `MyDrive/Musicm8/audio/`.
-4. Run the notebook from top to bottom.
-5. Checkpoints and tokenized audio are stored in `MyDrive/Musicm8/work/`, so later sessions can resume.
-
-### Kaggle
-
-1. Open the Kaggle badge above.
-2. Enable a GPU accelerator in notebook settings.
-3. Attach a Kaggle Dataset containing your authorized training audio.
-4. Enable Internet for the notebook so it can clone this repo and download pretrained codec/text weights.
-5. Run all cells. Use **Save Version** / notebook outputs to keep `latest.pt` between sessions.
-
-GPU availability, accelerator type, quotas and session limits are controlled by Colab/Kaggle and can change.
-
-## Local training commands
-
-The notebooks automate these same steps:
-
-```bash
-pip install -r requirements.txt
-
-python tokenize_dataset.py \
-  --manifest data/manifest.jsonl \
-  --out data/tokens \
-  --codec encodec24 \
-  --channels 1 \
-  --clip-seconds 8 \
-  --stride-seconds 8 \
-  --keep-tail \
-  --device cuda
-
-python train.py \
-  --data data/tokens/index.jsonl \
-  --config configs/v2-tiny.json \
-  --out runs/tiny-overfit \
-  --batch-size 2 \
-  --grad-accum 2 \
-  --steps 2000 \
-  --device cuda
-
-python generate.py \
-  --checkpoint runs/tiny-overfit/latest.pt \
-  --prompt "dark atmospheric electronic music with deep bass" \
-  --seconds 8 \
-  --out sample.wav \
-  --device cuda
-```
-
-## Architecture
-
-The core path is:
+Persistent files are stored under `MyDrive/Musicm8/work/`:
 
 ```text
-prompt / structured controls
-          │
-          ▼
-      text encoder
-          │
-          ▼
-previous codec tokens → causal Transformer
-          │
-          ▼
-delayed RVQ codebook predictions
-          │
-          ▼
-       audio codec
-          │
-          ▼
-          WAV
+work/
+  daw_dataset/          # separated stems, analyses and extracted MIDI
+  daw_symbolic/         # symbolic arranger checkpoints
+  daw_projects/latest/  # generated arrangement.mid, MIDI stems, preview.wav, project.json
 ```
 
-The model code also contains conditioning support for tempo, key, chords, sections, melody, energy, phonemes and semantic IDs, plus reference-audio context for continuation/infill experiments.
+The workflow is restart-friendly: stem analysis is cached, and symbolic training resumes from `latest.pt`.
 
-## Optional web service
+## What is extracted
 
-The repository still contains `render_app.py` and `render.yaml` for serving a trained checkpoint through FastAPI. That path is optional. If you want to stay at £0, focus on the Colab/Kaggle notebooks first and keep the checkpoint in Drive/Kaggle outputs rather than deploying an always-on service.
+`daw_extract.py` creates four Demucs stems and derives:
 
-## Checkpoint format
+- **drums MIDI** from onset/transient analysis, mapped to kick/snare/hat GM notes
+- **bass MIDI** from monophonic pitch tracking
+- **chord MIDI** from harmonic/chroma analysis
+- **melody MIDI** primarily from the vocal/melodic stem
+- BPM and an approximate musical key
 
-A Musicm8 checkpoint contains:
+The extractor is deliberately conservative and editable: it gives the arranger symbolic material without pretending that automatic transcription is perfect.
 
-- `model_config`
-- `model`
-- optimizer/scheduler state for resume
-- `data_meta.codec`
+## VST / DAW rendering
 
-`data_meta.codec` tells generation which neural codec produced the training tokens.
+Colab does not host normal desktop VST plugins reliably. Musicm8 therefore uses FluidSynth/SoundFont only for a quick preview. The real output is the MIDI project bundle:
+
+```text
+daw_projects/latest/
+  arrangement.mid
+  midi_stems/
+    drums.mid
+    bass.mid
+    chords.mid
+    melody.mid
+  project.json
+  preview.wav
+```
+
+Open those MIDI stems in your DAW and route them to the drum machines, synths, samplers and effects you actually want to use. This is intentionally closer to a normal production workflow than end-to-end raw-audio generation.
+
+## Local commands
+
+```bash
+pip install -r requirements-daw.txt
+
+python daw_extract.py \
+  --audio-dir data/audio \
+  --out data/daw_dataset \
+  --device cuda
+
+python train_symbolic.py \
+  --index data/daw_dataset/index.jsonl \
+  --out runs/daw_symbolic \
+  --steps 4000 \
+  --device cuda
+
+python generate_symbolic.py \
+  --checkpoint runs/daw_symbolic/latest.pt \
+  --out project/arrangement.mid \
+  --bars 8 \
+  --device cuda
+
+python render_daw.py \
+  --midi project/arrangement.mid \
+  --out project/preview.wav
+```
+
+Or run the orchestration command:
+
+```bash
+python daw_workflow.py --root /path/to/Musicm8 --steps 4000 --bars 8
+```
+
+## Symbolic model
+
+The DAW arranger uses a compact causal Transformer over a constrained MIDI-event vocabulary. Events encode bar position, instrument role, MIDI pitch, duration and velocity. During generation, the grammar is constrained so the output remains valid MIDI. Training also uses pitch-transposition augmentation, which is much more data-efficient than learning EnCodec acoustic codebooks from a handful of songs.
+
+## Legacy neural-audio experiment
+
+The earlier EnCodec-token autoregressive model remains in the repository (`model.py`, `training_model.py`, `train.py`, `generate.py`) as a research path. It successfully proves the audio-token pipeline, but the tiny from-scratch model is no longer the recommended route for the main Musicm8 workflow.
 
 ## Important
 
-Only train on audio you are authorized to use. Third-party pretrained components and model weights can have licenses separate from this repository.
+Only train on audio you are authorized to use. Demucs, pretrained separation weights, SoundFonts and any VSTs you use have their own licenses. GPU availability and Colab session limits are controlled by Google and can change.
