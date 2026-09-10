@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import shutil
 import subprocess
@@ -13,7 +12,6 @@ from pathlib import Path
 import librosa
 import numpy as np
 import pretty_midi
-import soundfile as sf
 from tqdm import tqdm
 
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
@@ -99,9 +97,10 @@ def separate_with_demucs(src: Path, out_dir: Path, device: str) -> dict[str, Pat
     tmp = out_dir / "_demucs"
     shutil.rmtree(tmp, ignore_errors=True)
     cmd = [
-        sys.executable, "-m", "demucs.separate",
+        sys.executable, "-m", "demucs",
         "-n", "htdemucs",
         "--device", device,
+        "--segment", "7",
         "--out", str(tmp),
         str(src),
     ]
@@ -133,7 +132,7 @@ def _segments_from_f0(
     active_start: int | None = None
     last_voiced: int | None = None
 
-    def flush(end_index: int | None) -> None:
+    def flush() -> None:
         nonlocal active_start, last_voiced
         if active_start is None or last_voiced is None:
             active_start = None; last_voiced = None
@@ -143,7 +142,8 @@ def _segments_from_f0(
         vals = vals[np.isfinite(vals)]
         if vals.size:
             start = float(times[lo])
-            end = float(times[min(hi, len(times) - 1)]) if hi < len(times) else float(times[-1])
+            end_idx = min(last_voiced + 1, len(times) - 1)
+            end = float(times[end_idx])
             if end - start >= min_note:
                 midi = int(np.clip(round(float(librosa.hz_to_midi(np.median(vals)))), 0, 127))
                 events.append(NoteEvent(start, max(end, start + min_note), midi, 92))
@@ -157,8 +157,8 @@ def _segments_from_f0(
         elif active_start is not None and last_voiced is not None:
             gap = float(times[i] - times[last_voiced])
             if gap > max_gap:
-                flush(i)
-    flush(len(times) - 1)
+                flush()
+    flush()
     return events
 
 
@@ -219,13 +219,8 @@ def infer_chords(path: Path, bpm: float, duration: float) -> list[NoteEvent]:
     times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
     beat = 60.0 / max(bpm, 1.0)
     window = beat * 2.0
-    triads: list[tuple[str, tuple[int, int, int]]] = []
-    for root in range(12):
-        triads.append(("maj", (root, (root + 4) % 12, (root + 7) % 12)))
-        triads.append(("min", (root, (root + 3) % 12, (root + 7) % 12)))
     events: list[NoteEvent] = []
     t = 0.0
-    last: tuple[int, str] | None = None
     while t < duration:
         mask = (times >= t) & (times < min(duration, t + window))
         if not np.any(mask):
@@ -239,13 +234,10 @@ def infer_chords(path: Path, bpm: float, duration: float) -> list[NoteEvent]:
                 score = float(profile[idx].sum() - 0.15 * (profile.sum() - profile[idx].sum()))
                 if score > score_best:
                     root_best, mode_best, score_best = root, mode, score
-        chord = (root_best, mode_best)
         third = 4 if mode_best == "maj" else 3
         pitches = [48 + root_best, 48 + root_best + third, 48 + root_best + 7]
-        # Avoid duplicate back-to-back chord events by extending is handled naturally by MIDI sustain.
         for pitch in pitches:
             events.append(NoteEvent(t, min(duration, t + window), int(pitch), 68))
-        last = chord
         t += window
     return events
 
@@ -262,19 +254,14 @@ def quantize(events: list[NoteEvent], bpm: float, subdivision: int = 4) -> list[
     return out
 
 
-def write_midi(
-    path: Path,
-    bpm: float,
-    tracks: dict[str, list[NoteEvent]],
-) -> None:
+def write_midi(path: Path, bpm: float, tracks: dict[str, list[NoteEvent]]) -> None:
     pm = pretty_midi.PrettyMIDI(initial_tempo=float(bpm))
     programs = {
         "bass": pretty_midi.instrument_name_to_program("Electric Bass (finger)"),
         "chords": pretty_midi.instrument_name_to_program("Electric Piano 1"),
         "melody": pretty_midi.instrument_name_to_program("Lead 1 (square)"),
     }
-    order = ["drums", "bass", "chords", "melody"]
-    for name in order:
+    for name in ("drums", "bass", "chords", "melody"):
         events = tracks.get(name, [])
         if not events:
             continue
