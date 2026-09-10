@@ -35,6 +35,42 @@ def choose_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
+def apply_t4_safety(args, cfg_dict: dict, device: torch.device) -> None:
+    """Make the tiny training command safe/restart-friendly on free Colab T4s.
+
+    Older copies of the Colab notebook may still request batch=2, workers=2,
+    max_seq_len=1024 and save_every=250.  Applying the guard here means a
+    rerun automatically becomes T4-safe as soon as it pulls the latest repo.
+    """
+    if device.type != "cuda":
+        return
+    try:
+        gpu_name = torch.cuda.get_device_name(0)
+    except Exception:
+        return
+    if "T4" not in gpu_name.upper():
+        return
+
+    old_batch = max(1, int(args.batch_size))
+    if old_batch > 1:
+        # Preserve the effective batch size while reducing peak VRAM.
+        args.grad_accum = max(1, int(args.grad_accum)) * old_batch
+        args.batch_size = 1
+    args.num_workers = 0
+    args.save_every = min(max(1, int(args.save_every)), 50)
+    cfg_dict["max_seq_len"] = min(int(cfg_dict.get("max_seq_len", 512)), 512)
+    cfg_dict["text_max_length"] = min(int(cfg_dict.get("text_max_length", 96)), 96)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    print("Applied Tesla T4 safety defaults:")
+    print(f"  batch_size={args.batch_size}")
+    print(f"  grad_accum={args.grad_accum}")
+    print(f"  num_workers={args.num_workers}")
+    print(f"  save_every={args.save_every}")
+    print(f"  max_seq_len={cfg_dict['max_seq_len']}")
+
+
 def make_infill_masks(frame_mask: torch.Tensor, min_frac: float, max_frac: float) -> tuple[torch.Tensor, torch.Tensor]:
     """Return known-context mask and gap-only loss mask."""
     known = frame_mask.clone()
@@ -97,6 +133,8 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
 
     cfg_dict = json.loads(args.config.read_text(encoding="utf-8"))
+    apply_t4_safety(args, cfg_dict, device)
+
     ds_probe = TokenDataset(args.data, random_crop=False)
     data_meta = ds_probe.meta
     codec_meta = data_meta.get("codec", {})
