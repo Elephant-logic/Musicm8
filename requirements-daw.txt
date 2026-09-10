@@ -1,0 +1,9 @@
+numpy>=1.26
+scipy>=1.11
+librosa>=0.10
+soundfile>=0.12
+pretty_midi>=0.2.10
+demucs>=4.0.1
+tqdm>=4.66
+torch>=2.2
+torchaudio>=2.2
