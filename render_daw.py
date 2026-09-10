@@ -25,7 +25,7 @@ def find_soundfont(explicit: Path | None) -> Path | None:
 
 def build_project_manifest(midi_path: Path, out_dir: Path) -> Path:
     pm = pretty_midi.PrettyMIDI(str(midi_path))
-    tempo_times, tempi = pm.get_tempo_changes()
+    _, tempi = pm.get_tempo_changes()
     bpm = float(tempi[0]) if len(tempi) else 120.0
     tracks = []
     for inst in pm.instruments:
@@ -60,7 +60,7 @@ def render_fluidsynth(midi: Path, out: Path, soundfont: Path) -> None:
     if not exe:
         raise RuntimeError("fluidsynth is not installed")
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [exe, "-ni", str(soundfont), str(midi), "-F", str(out), "-r", "44100"]
+    cmd = [exe, "-ni", "-F", str(out), "-r", "44100", str(soundfont), str(midi)]
     print("$", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
