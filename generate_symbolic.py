@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from midi_tokens import (
-    BAR, BOS, EOS, PAD, VOCAB_SIZE, advance_phase, save_tokens_as_midi,
+    BAR, BOS, EOS, VOCAB_SIZE, advance_phase, save_tokens_as_midi,
     valid_next_tokens,
 )
 from symbolic_model import SymbolicConfig, SymbolicTransformer
@@ -20,6 +20,8 @@ def sample_allowed(
     top_k: int,
     generator: torch.Generator,
 ) -> int:
+    if not allowed:
+        raise RuntimeError("No legal MIDI tokens are available for the current grammar state")
     idx = torch.tensor(allowed, device=logits.device, dtype=torch.long)
     vals = logits.index_select(0, idx) / max(temperature, 1e-4)
     if 0 < top_k < vals.numel():
@@ -36,9 +38,11 @@ def split_tracks(combined: Path, out_dir: Path) -> None:
     import pretty_midi
 
     pm = pretty_midi.PrettyMIDI(str(combined))
+    _, tempi = pm.get_tempo_changes()
+    bpm = float(tempi[0]) if len(tempi) else 120.0
     out_dir.mkdir(parents=True, exist_ok=True)
     for inst in pm.instruments:
-        one = pretty_midi.PrettyMIDI(initial_tempo=float(pm.estimate_tempo()) if pm.get_end_time() > 0 else 120.0)
+        one = pretty_midi.PrettyMIDI(initial_tempo=bpm)
         copied = pretty_midi.Instrument(program=inst.program, is_drum=inst.is_drum, name=inst.name)
         copied.notes = list(inst.notes)
         copied.control_changes = list(inst.control_changes)
@@ -81,6 +85,8 @@ def main() -> None:
     phase = "event_or_bar"
     bars_seen = 1
     events_this_bar = 0
+    min_events_per_bar = 6
+    max_events_per_bar = 36
     max_tokens = min(cfg.max_seq_len, 2 + args.bars * 180)
 
     while len(tokens) < max_tokens and phase != "done":
@@ -88,14 +94,21 @@ def main() -> None:
         logits = model.next_logits(ids)[0]
         allowed = valid_next_tokens(phase, allow_eos=True)
         if phase == "event_or_bar":
-            # Do not end before the requested number of bars; do not create more than requested.
             if bars_seen < args.bars:
+                # Every requested bar gets real content. This also prevents an
+                # undertrained model from emitting a run of empty BAR tokens.
                 allowed = [x for x in allowed if x != EOS]
+                if events_this_bar < min_events_per_bar:
+                    allowed = [x for x in allowed if x != BAR]
+                elif events_this_bar >= max_events_per_bar:
+                    allowed = [BAR]
             else:
+                # Final requested bar: no extra BAR tokens, and do not end it empty.
                 allowed = [x for x in allowed if x != BAR]
-                # Give the final bar enough material before EOS becomes legal.
-                if events_this_bar < 4:
+                if events_this_bar < min_events_per_bar:
                     allowed = [x for x in allowed if x != EOS]
+                elif events_this_bar >= max_events_per_bar:
+                    allowed = [EOS]
         token = sample_allowed(logits, allowed, args.temperature, args.top_k, generator)
         if token == BAR:
             bars_seen += 1
@@ -106,10 +119,9 @@ def main() -> None:
         phase = advance_phase(token, phase)
 
     if tokens[-1] != EOS:
-        # Never leave a half event in the MIDI parser. Trim back to the most recent complete event/BAR.
+        # Never leave a half event in the MIDI parser. Trim back to a complete boundary.
         while tokens and phase not in ("event_or_bar", "done"):
             tokens.pop()
-            # Recompute phase from scratch after trimming.
             phase = "start"
             for tok in tokens[1:]:
                 phase = advance_phase(tok, phase)
@@ -120,7 +132,7 @@ def main() -> None:
     split_tracks(args.out, args.out.parent / "midi_stems")
     print(f"✅ MIDI arrangement: {args.out}")
     print(f"✅ MIDI stems: {args.out.parent/'midi_stems'}")
-    print(f"Bars: {args.bars} | BPM: {bpm:.1f} | Tokens: {len(tokens)}")
+    print(f"Bars: {min(bars_seen, args.bars)} | BPM: {bpm:.1f} | Tokens: {len(tokens)}")
 
 
 if __name__ == "__main__":
