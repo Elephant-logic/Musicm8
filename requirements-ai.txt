@@ -1,0 +1,4 @@
+-r requirements-daw.txt
+transformers>=4.45,<5.0
+accelerate>=1.0
+sentencepiece>=0.2
