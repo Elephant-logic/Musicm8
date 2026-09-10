@@ -16,16 +16,14 @@ def run(cmd: list[str], cwd: Path) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Musicm8 AI producer: references -> AI plan -> MIDI -> inverse synth matching -> own synth/FX."
-    )
+    p = argparse.ArgumentParser(description="Musicm8 AI producer v3: references -> producer AI -> coherent MIDI -> Synth v2 inverse sound design -> mix/master.")
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent)
     p.add_argument("--idea", required=True)
     p.add_argument("--bars", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--ai-model", default="Qwen/Qwen2.5-1.5B-Instruct")
-    p.add_argument("--match-iters", type=int, default=40)
+    p.add_argument("--match-iters", type=int, default=48)
     p.add_argument("--match-seconds", type=float, default=3.0)
     p.add_argument("--no-ai", action="store_true")
     p.add_argument("--skip-sound-match", action="store_true")
@@ -40,37 +38,24 @@ def main() -> None:
     dataset = work / "daw_dataset"
     reference_dir = work / "reference_library"
     library = reference_dir / "library.json"
-    patch_cache = work / "sound_patch_cache"
+    patch_cache = work / "sound_patch_cache_v2"
     old_codec_index = work / "tokens-encodec24" / "index.jsonl"
-
     project = work / "ai_projects" / "latest"
     plan = project / "plan.json"
     arrangement = project / "arrangement.mid"
     matched = project / "matched_patches.json"
 
-    audio.mkdir(parents=True, exist_ok=True)
-    work.mkdir(parents=True, exist_ok=True)
-    reference_dir.mkdir(parents=True, exist_ok=True)
-    patch_cache.mkdir(parents=True, exist_ok=True)
-    project.mkdir(parents=True, exist_ok=True)
+    for path in (audio, work, reference_dir, patch_cache, project):
+        path.mkdir(parents=True, exist_ok=True)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU required for the Colab AI producer workflow.")
     print("GPU:", torch.cuda.get_device_name(0))
     print("Idea:", args.idea)
+    print("Sound engine: Musicm8 Synth v2")
 
     print("\n=== 1/6 ANALYSE REFERENCE SONGS ===")
-    extract_cmd = [
-        sys.executable,
-        "-u",
-        "daw_extract.py",
-        "--audio-dir",
-        audio,
-        "--out",
-        dataset,
-        "--device",
-        "cuda",
-    ]
+    extract_cmd = [sys.executable, "-u", "daw_extract.py", "--audio-dir", audio, "--out", dataset, "--device", "cuda"]
     if args.force_extract:
         extract_cmd.append("--force")
     run(extract_cmd, repo)
@@ -79,117 +64,36 @@ def main() -> None:
         raise RuntimeError(f"Missing DAW reference index: {index}")
 
     print("\n=== 2/6 BUILD MULTIMODAL REFERENCE LIBRARY ===")
-    lib_cmd = [
-        sys.executable,
-        "-u",
-        "reference_library.py",
-        "--index",
-        index,
-        "--out",
-        library,
-    ]
+    lib_cmd = [sys.executable, "-u", "reference_library.py", "--index", index, "--out", library]
     if old_codec_index.exists():
         lib_cmd += ["--codec-index", old_codec_index]
     run(lib_cmd, repo)
 
     print("\n=== 3/6 AI PRODUCER BRAIN ===")
-    brain_cmd = [
-        sys.executable,
-        "-u",
-        "producer_ai.py",
-        "--idea",
-        args.idea,
-        "--references",
-        library,
-        "--out",
-        plan,
-        "--model",
-        args.ai_model,
-        "--device",
-        "cuda",
-        "--bars",
-        str(args.bars),
-    ]
+    brain_cmd = [sys.executable, "-u", "producer_ai.py", "--idea", args.idea, "--references", library, "--out", plan, "--model", args.ai_model, "--device", "cuda", "--bars", str(args.bars)]
     if args.no_ai:
         brain_cmd.append("--no-ai")
     run(brain_cmd, repo)
 
     print("\n=== 4/6 COMPOSE EDITABLE MIDI ===")
-    run(
-        [
-            sys.executable,
-            "-u",
-            "plan_to_midi.py",
-            "--plan",
-            plan,
-            "--out",
-            project,
-            "--seed",
-            str(args.seed),
-        ],
-        repo,
-    )
+    run([sys.executable, "-u", "plan_to_midi.py", "--plan", plan, "--out", project, "--seed", str(args.seed)], repo)
 
-    print("\n=== 5/6 INVERSE SOUND DESIGN ===")
+    print("\n=== 5/6 SYNTH V2 INVERSE SOUND DESIGN ===")
     if args.skip_sound_match:
-        matched.write_text(
-            json.dumps(
-                {
-                    "format": "musicm8-inverse-synth-v1",
-                    "roles": {},
-                    "note": "Sound matching skipped; renderer uses spectral fingerprint fallback patches.",
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        matched.write_text(json.dumps({"format": "musicm8-inverse-synth-v2", "roles": {}, "note": "Sound matching skipped; Synth v2 renderer uses fallback patches."}, indent=2), encoding="utf-8")
         print("⏭️ Sound matching skipped.")
     else:
-        match_cmd = [
-            sys.executable,
-            "-u",
-            "sound_matcher.py",
-            "--plan",
-            plan,
-            "--references",
-            library,
-            "--out",
-            matched,
-            "--iterations",
-            str(max(0, args.match_iters)),
-            "--seconds",
-            str(args.match_seconds),
-            "--seed",
-            str(args.seed),
-            "--cache-dir",
-            patch_cache,
-        ]
+        match_cmd = [sys.executable, "-u", "sound_matcher_v2.py", "--plan", plan, "--references", library, "--out", matched, "--iterations", str(max(0, args.match_iters)), "--seconds", str(args.match_seconds), "--seed", str(args.seed), "--cache-dir", patch_cache]
         if args.force_sound_match:
             match_cmd.append("--force")
         run(match_cmd, repo)
 
-    print("\n=== 6/6 MUSICM8 SYNTH + FX + MASTER ===")
-    run(
-        [
-            sys.executable,
-            "-u",
-            "render_matched.py",
-            "--plan",
-            plan,
-            "--midi",
-            arrangement,
-            "--references",
-            library,
-            "--patches",
-            matched,
-            "--out",
-            project,
-        ],
-        repo,
-    )
+    print("\n=== 6/6 SYNTH V2 + FX + SIDECHAIN + MASTER ===")
+    run([sys.executable, "-u", "render_matched_v2.py", "--plan", plan, "--midi", arrangement, "--patches", matched, "--out", project], repo)
 
     payload = {
-        "format": "musicm8-ai-project-v2",
+        "format": "musicm8-ai-project-v3",
+        "engine": "musicm8-synth-v2",
         "idea": args.idea,
         "plan": str(plan),
         "reference_library": str(library),
@@ -201,20 +105,16 @@ def main() -> None:
         "synth_patches": str(project / "synth_patches.json"),
         "master": str(project / "master.wav"),
         "legacy_codec_tokens": str(old_codec_index) if old_codec_index.exists() else None,
-        "note": (
-            "The producer AI chooses musical and sonic references. For each selected role, Musicm8 renders its own synth "
-            "against a short aligned reference-stem/MIDI window, compares log-mel spectrum, envelope, transients and loudness, "
-            "iteratively searches synth/FX parameters, caches the resulting reference patch, then applies the AI's creative "
-            "sound-design controls before rendering the new song. Existing EnCodec tokens remain linked for future neural residual/resynthesis."
-        ),
+        "sound_design": {"learned_harmonic_wavetables": True, "fm_layer": True, "noise_texture_layer": True, "per_drum_voice_analysis": True, "multi_resolution_match": [512, 2048, 8192], "eq": "3-band", "compressor": True, "kick_sidechain": True},
+        "note": "Musicm8 v3 keeps the producer AI and reference library, but the sound engine is Synth v2. Pitched references are converted into reusable harmonic/wavetable fingerprints and searched with FM, filtering, envelopes, modulation, EQ, compression and FX. Drum references are analysed separately as kick/snare/hat voices. The final mix uses DAW-style stem balance and kick-triggered sidechain. Existing EnCodec tokens remain linked for a future neural residual layer."
     }
     (project / "project.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    print("\n✅ MUSICM8 AI PRODUCER COMPLETE")
+    print("\n✅ MUSICM8 AI PRODUCER V3 COMPLETE")
     print("Plan:", plan)
     print("MIDI:", arrangement)
     print("MIDI stems:", project / "midi_stems")
-    print("Matched patches:", matched)
+    print("Matched v2 patches:", matched)
     print("A/B sound matches:", project / "sound_matches")
     print("Audio stems:", project / "audio_stems")
     print("Synth patches:", project / "synth_patches.json")
