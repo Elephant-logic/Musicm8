@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import TokenDataset, collate_batch
-from model import AudioTokenTransformer, ModelConfig
+from training_model import AudioTokenTransformer, ModelConfig
 
 
 def seed_everything(seed: int) -> None:
@@ -39,7 +39,7 @@ def apply_t4_safety(args, cfg_dict: dict, device: torch.device) -> None:
     """Make the tiny training command safe/restart-friendly on free Colab T4s.
 
     Older copies of the Colab notebook may still request batch=2, workers=2,
-    max_seq_len=1024 and save_every=250.  Applying the guard here means a
+    max_seq_len=1024 and save_every=250. Applying the guard here means a
     rerun automatically becomes T4-safe as soon as it pulls the latest repo.
     """
     if device.type != "cuda":
