@@ -1,125 +1,148 @@
 # Musicm8
 
-Musicm8 is now built around a **hybrid AI-producer / DAW workflow** rather than asking a tiny model to learn finished waveform audio from scratch.
+Musicm8 is now built as an **AI producer + reference-library + synth/FX system** rather than a tiny end-to-end waveform generator.
 
 The main path is:
 
 ```text
-training songs
+your reference songs
     ↓
-Demucs stem separation
+Demucs stems + extracted MIDI + spectral fingerprints
     ↓
-drums / bass / vocals / other
+existing EnCodec-token links are kept in the reference library
     ↓
-BPM + key + beat/chord/pitch analysis
+local pretrained AI producer brain
     ↓
-editable MIDI: drums / bass / chords / melody
+BPM / key / sections / chord degrees / groove / reference choices / sound-design controls
     ↓
-small symbolic arrangement Transformer
+coherent deterministic music engine
     ↓
-new multitrack MIDI arrangement
+editable drums / bass / chords / melody MIDI
     ↓
-SoundFont preview in Colab
+Musicm8 native synth + FX engine
     ↓
-DAW + your VST instruments / effects / mix
+audio stems + master.wav
 ```
 
-This keeps the part that a small dataset can realistically teach — **rhythm, notes, arrangement and style patterns** — separate from instrument synthesis and mastering. The generated MIDI remains editable.
+The idea is that the songs in `MyDrive/Musicm8/audio/` act as **references**. Musicm8 learns from their arrangement and sonic measurements instead of trying to memorize the final waveform. MIDI describes what was played; stem spectra describe what it sounded like; old EnCodec tokens remain linked for a later neural-resynthesis layer.
 
 ## One-click Colab
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Elephant-logic/Musicm8/blob/main/notebooks/Musicm8_Colab.ipynb)
 
 1. Choose **Runtime → Change runtime type → GPU**.
-2. Put audio you are authorized to use in `MyDrive/Musicm8/audio/`.
-3. Run the large notebook cell.
-4. The first run separates each song with Demucs, analyzes it and builds MIDI. This is cached in Drive.
-5. A compact symbolic Transformer trains/resumes from the cached MIDI dataset.
-6. Musicm8 generates `arrangement.mid`, individual MIDI stems and a quick SoundFont preview.
-7. Import the MIDI into Ableton, FL Studio, Logic, Reaper or another DAW and assign your preferred VSTs.
+2. Put reference audio you are authorized to use in `MyDrive/Musicm8/audio/`.
+3. Edit the `IDEA = "..."` line in the big notebook cell.
+4. Run the cell.
+5. First run: Demucs prepares/caches the reference stems and the local producer model downloads into Drive.
+6. Later runs reuse the cached reference analysis and AI-model files.
+7. Listen to `master.wav`, or edit the MIDI/audio stems and synth patches.
 
-Persistent files are stored under `MyDrive/Musicm8/work/`:
+The default producer brain is a small local pretrained instruct model (`Qwen/Qwen2.5-1.5B-Instruct`) loaded with Transformers. It does **not** synthesize the sound directly. Its job is to reason about the idea and the reference library and write a validated `plan.json`. That separation means the AI model can later be swapped for a stronger local or hosted model without rewriting the music/synth engine.
 
-```text
-work/
-  daw_dataset/          # separated stems, analyses and extracted MIDI
-  daw_symbolic/         # symbolic arranger checkpoints
-  daw_projects/latest/  # generated arrangement.mid, MIDI stems, preview.wav, project.json
-```
-
-The workflow is restart-friendly: stem analysis is cached, and symbolic training resumes from `latest.pt`.
-
-## What is extracted
-
-`daw_extract.py` creates four Demucs stems and derives:
-
-- **drums MIDI** from onset/transient analysis, mapped to kick/snare/hat GM notes
-- **bass MIDI** from monophonic pitch tracking
-- **chord MIDI** from harmonic/chroma analysis
-- **melody MIDI** primarily from the vocal/melodic stem
-- BPM and an approximate musical key
-
-The extractor is deliberately conservative and editable: it gives the arranger symbolic material without pretending that automatic transcription is perfect.
-
-## VST / DAW rendering
-
-Colab does not host normal desktop VST plugins reliably. Musicm8 therefore uses FluidSynth/SoundFont only for a quick preview. The real output is the MIDI project bundle:
+## Persistent files
 
 ```text
-daw_projects/latest/
-  arrangement.mid
-  midi_stems/
-    drums.mid
-    bass.mid
-    chords.mid
-    melody.mid
-  project.json
-  preview.wav
+MyDrive/Musicm8/work/
+  daw_dataset/                 # cached Demucs stems + extracted MIDI/analysis
+  tokens-encodec24/            # legacy acoustic tokens, retained as references
+  reference_library/
+    library.json               # multimodal reference catalogue
+  hf_cache/                    # local producer-brain model cache
+  ai_projects/latest/
+    plan.json                  # AI producer decisions
+    arrangement.mid            # complete editable arrangement
+    midi_stems/
+      drums.mid
+      bass.mid
+      chords.mid
+      melody.mid
+    audio_stems/
+      drums.wav
+      bass.wav
+      chords.wav
+      melody.wav
+    synth_patches.json         # measured-reference-derived synth settings
+    master.wav
+    project.json
 ```
 
-Open those MIDI stems in your DAW and route them to the drum machines, synths, samplers and effects you actually want to use. This is intentionally closer to a normal production workflow than end-to-end raw-audio generation.
+## What the reference library stores
 
-## Local commands
+`reference_library.py` combines the existing analysis into one catalogue. For every reference it keeps:
+
+- BPM, approximate key and duration
+- source stem paths
+- extracted drums/bass/chords/melody MIDI paths
+- note density, median pitch and pitch range
+- RMS/dynamics
+- spectral centroid and rolloff
+- spectral flatness/noise character
+- sub, bass, low-mid, high-mid and air energy ratios
+- transient/onset density
+- paths to existing EnCodec token clips when available
+
+The LLM only sees compact summaries of these measurements; the raw audio and token files stay on disk for the rendering/resynthesis layers.
+
+## AI producer brain
+
+`producer_ai.py` turns a text idea plus reference summaries into a structured plan. It chooses:
+
+- style
+- BPM and key
+- section layout and section energy
+- a diatonic chord-degree progression
+- swing and instrument densities
+- which reference to use for drums, bass, chords and melody character
+- sound-design controls such as sub level, brightness, drive, detune, filter movement, delay, reverb and width
+- basic master controls
+
+The JSON is validated/clamped before the rest of the system uses it. If the local model cannot load, Musicm8 falls back to a deterministic theory-based planner so the workflow still runs.
+
+## Composition engine
+
+`plan_to_midi.py` is deliberately constrained. It converts the producer plan into repeated, key-aware musical patterns instead of sampling arbitrary MIDI events. It currently supports genre-specific drum grids, bass patterns tied to the chord roots, diatonic chord voicings, repeated melody motifs, section energy and swing.
+
+This is the first step toward a more capable hierarchical composer. The earlier learned symbolic Transformer is still in the repo for experiments, but it is no longer the only source of musical structure.
+
+## Musicm8 synth / FX
+
+`musicm8_synth.py` is the first native sound engine. It currently provides:
+
+- sine / triangle / band-limited-ish saw and square oscillators
+- detuned/unison voices
+- bass sub layer
+- ADSR envelopes
+- low/high-pass filtering
+- kick/snare/hat synthesis
+- saturation
+- stereo widening
+- tempo delay
+- simple reverb
+- per-track rendering and final master normalization
+
+The starting patch for each role is derived from the selected reference stem's measured spectral fingerprint. The AI then steers those parameters. This is the first implementation of the **"analyse sonic frequencies, then rebuild a similar sound with editable synthesis parameters"** idea.
+
+It is not yet a full Serum/Vital-class synth. The next sound-design milestones are wavetable import/learning, better filters, LFO/modulation routing, convolution/algorithmic reverb, compressors/EQ, and an optimizer that repeatedly renders a patch and minimizes multi-resolution spectral/perceptual distance to a chosen reference stem.
+
+## Local command
 
 ```bash
-pip install -r requirements-daw.txt
+pip install -r requirements-ai.txt
 
-python daw_extract.py \
-  --audio-dir data/audio \
-  --out data/daw_dataset \
+python ai_producer_workflow.py \
+  --root /path/to/Musicm8 \
+  --idea "dark UK garage, emotional chords, deep moving bass" \
+  --bars 32 \
   --device cuda
-
-python train_symbolic.py \
-  --index data/daw_dataset/index.jsonl \
-  --out runs/daw_symbolic \
-  --steps 4000 \
-  --device cuda
-
-python generate_symbolic.py \
-  --checkpoint runs/daw_symbolic/latest.pt \
-  --out project/arrangement.mid \
-  --bars 8 \
-  --device cuda
-
-python render_daw.py \
-  --midi project/arrangement.mid \
-  --out project/preview.wav
 ```
 
-Or run the orchestration command:
+(Colab supplies the GPU and Drive paths automatically through the notebook.)
 
-```bash
-python daw_workflow.py --root /path/to/Musicm8 --steps 4000 --bars 8
-```
+## Legacy experiments
 
-## Symbolic model
-
-The DAW arranger uses a compact causal Transformer over a constrained MIDI-event vocabulary. Events encode bar position, instrument role, MIDI pitch, duration and velocity. During generation, the grammar is constrained so the output remains valid MIDI. Training also uses pitch-transposition augmentation, which is much more data-efficient than learning EnCodec acoustic codebooks from a handful of songs.
-
-## Legacy neural-audio experiment
-
-The earlier EnCodec-token autoregressive model remains in the repository (`model.py`, `training_model.py`, `train.py`, `generate.py`) as a research path. It successfully proves the audio-token pipeline, but the tiny from-scratch model is no longer the recommended route for the main Musicm8 workflow.
+The earlier EnCodec autoregressive model and the first symbolic-arranger experiment remain in the repository. They are useful research components and their cached data is retained, but the AI-producer/reference/synth workflow is now the recommended path.
 
 ## Important
 
-Only train on audio you are authorized to use. Demucs, pretrained separation weights, SoundFonts and any VSTs you use have their own licenses. GPU availability and Colab session limits are controlled by Google and can change.
+Only use reference audio you are authorized to use. Demucs and any pretrained models have their own licenses. The system is designed to learn reusable musical/sonic characteristics and create new arrangements rather than reproduce reference melodies or recordings verbatim.
