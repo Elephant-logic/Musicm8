@@ -12,9 +12,12 @@ from planner import heuristic_plan, load_plan, plan_to_conditions
 
 
 def choose_device(name: str) -> torch.device:
-    if name != "auto": return torch.device(name)
-    if torch.cuda.is_available(): return torch.device("cuda")
-    if torch.backends.mps.is_available(): return torch.device("mps")
+    if name != "auto":
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -35,7 +38,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Generate/continue music with Musicm8 V2.")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--prompt", required=True)
-    p.add_argument("--seconds", type=float, default=12.0, help="Total output length.")
+    p.add_argument("--seconds", type=float, default=12.0, help="Requested total output length. Automatically capped to the checkpoint context window when necessary.")
     p.add_argument("--plan", type=Path, default=None)
     p.add_argument("--bpm", type=float, default=None)
     p.add_argument("--key", default=None)
@@ -50,21 +53,44 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     args = p.parse_args()
 
+    if args.seconds <= 0:
+        raise ValueError("--seconds must be > 0")
+
     device = choose_device(args.device)
     _, model, codec = load_model(args.checkpoint, device)
-    frames = max(1, round(args.seconds * codec.info.frame_rate))
-    plan = load_plan(args.plan) if args.plan else heuristic_plan(args.prompt, args.seconds, args.bpm, args.key)
-    plan.duration = args.seconds
+
+    requested_seconds = float(args.seconds)
+    requested_frames = max(1, round(requested_seconds * codec.info.frame_rate))
+    max_frames = max(1, int(model.cfg.max_seq_len) - int(model.pattern.max_delay))
+    frames = min(requested_frames, max_frames)
+    actual_seconds = frames / float(codec.info.frame_rate)
+
+    if requested_frames > max_frames:
+        max_seconds = max_frames / float(codec.info.frame_rate)
+        print(
+            f"⚠️ Requested {requested_seconds:.2f}s needs "
+            f"{model.pattern.sequence_length(requested_frames)} delayed steps, but this "
+            f"checkpoint supports {model.cfg.max_seq_len}. "
+            f"Automatically capping this sample to {max_seconds:.2f}s."
+        )
+
+    plan = load_plan(args.plan) if args.plan else heuristic_plan(args.prompt, actual_seconds, args.bpm, args.key)
+    plan.duration = actual_seconds
     cond = plan_to_conditions(plan, frames, codec.info.frame_rate)
+
     if args.semantic_checkpoint:
         from semantic_lm import SemanticLM, SemanticLMConfig
+
         sem_ck = torch.load(args.semantic_checkpoint, map_location="cpu", weights_only=False)
         sem = SemanticLM(SemanticLMConfig(**sem_ck["config"])).to(device)
-        sem.load_trainable_state_dict(sem_ck["model"]); sem.eval()
+        sem.load_trainable_state_dict(sem_ck["model"])
+        sem.eval()
         sem_rate = float(sem_ck["semantic_frame_rate"])
-        sem_steps = max(1, round(args.seconds * sem_rate))
+        sem_steps = max(1, round(actual_seconds * sem_rate))
         sem_ids = sem.generate(args.prompt, sem_steps, seed=args.seed)[0].cpu()
-        aligned = torch.nn.functional.interpolate(sem_ids.float().view(1,1,-1), size=frames, mode="nearest").long().view(1,-1)
+        aligned = torch.nn.functional.interpolate(
+            sem_ids.float().view(1, 1, -1), size=frames, mode="nearest"
+        ).long().view(1, -1)
         cond["semantic_ids"] = aligned.clamp_max(model.cfg.condition["semantic_vocab"] - 1)
 
     prompt_codes = None
@@ -72,16 +98,27 @@ def main() -> None:
         wav, sr = torchaudio.load(args.prompt_audio)
         prompt_codes = codec.encode(wav, sr).unsqueeze(0)
         if prompt_codes.shape[-1] >= frames:
-            raise ValueError("prompt audio must be shorter than --seconds total output")
+            raise ValueError(
+                f"prompt audio must be shorter than the generated output ({actual_seconds:.2f}s after context-window capping)"
+            )
 
-    print(f"Generating {args.seconds:.2f}s with {codec.info.name}, Q={codec.info.num_codebooks}, {codec.info.frame_rate:.2f} fps")
+    print(
+        f"Generating {actual_seconds:.2f}s with {codec.info.name}, "
+        f"Q={codec.info.num_codebooks}, {codec.info.frame_rate:.2f} fps"
+    )
     codes = model.generate(
-        args.prompt, frames, cond, prompt_codes=prompt_codes,
-        temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
-        cfg_scale=args.cfg_scale, seed=args.seed,
+        args.prompt,
+        frames,
+        cond,
+        prompt_codes=prompt_codes,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        cfg_scale=args.cfg_scale,
+        seed=args.seed,
     )
     wav = codec.decode(codes)
-    target_samples = round(args.seconds * codec.info.sample_rate)
+    target_samples = round(actual_seconds * codec.info.sample_rate)
     wav = wav[..., :target_samples]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(args.out, wav, codec.info.sample_rate)
