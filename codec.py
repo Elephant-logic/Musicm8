@@ -74,6 +74,9 @@ class Encodec24Codec:
 
     @torch.no_grad()
     def _decode_mono(self, codes: torch.Tensor) -> torch.Tensor:
+        # Token files are stored as int16 to save Drive space, but EnCodec's
+        # codebook lookup expects integer index tensors (int32/int64).
+        codes = codes.long()
         return self.model.decode([(codes.unsqueeze(0).to(self.device), None)])[0]
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
@@ -109,6 +112,7 @@ class HFEncodec32Codec:
 
     @torch.no_grad()
     def _decode_mono(self, codes: torch.Tensor) -> torch.Tensor:
+        codes = codes.long()
         out = self.model.decode(codes.unsqueeze(0).unsqueeze(0).to(self.device), [None], return_dict=True)
         return out.audio_values[0]
 
@@ -149,6 +153,7 @@ class DACCodec:
 
     @torch.no_grad()
     def _decode_mono(self, codes: torch.Tensor) -> torch.Tensor:
+        codes = codes.long()
         out = self.model.quantizer.from_codes(codes.unsqueeze(0).to(self.device))
         z = out[0] if isinstance(out, (tuple, list)) else out
         return self.model.decode(z)[0]
@@ -182,7 +187,7 @@ class CustomMusicCodec:
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         if codes.ndim == 2: codes = codes.unsqueeze(0)
         if codes.shape[0] != 1: raise ValueError("decode currently supports batch size 1")
-        return self.model.decode_codes(codes.to(self.device))[0].cpu()
+        return self.model.decode_codes(codes.long().to(self.device))[0].cpu()
 
 
 def create_codec(name: str, device: torch.device, *, channels: int = 1, bandwidth: float = 3.0, model_type: str = "44khz", n_quantizers: int | None = None, custom_checkpoint: str | None = None) -> AudioCodec:
