@@ -15,9 +15,22 @@ def run(cmd: list[str], cwd: Path) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
+def run_optional(cmd: list[str], cwd: Path, label: str) -> tuple[bool, str | None]:
+    try:
+        run(cmd, cwd)
+        return True, None
+    except Exception as exc:
+        print(f"⚠️ {label} failed: {exc}")
+        print("Instrumental, lyrics and vocal score are still saved. You can rerun later without losing the project.")
+        return False, str(exc)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Musicm8 AI producer v3.1: references -> AI plan -> hierarchical MIDI -> Synth v2 inverse sound design -> stereo mix/master."
+        description=(
+            "Musicm8 AI producer v4: references -> producer AI -> original lyrics -> hierarchical MIDI -> "
+            "inverse sound design -> polished instrumental -> aligned vocal score -> ACE-Step neural vocals -> final mix."
+        )
     )
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent)
@@ -27,7 +40,11 @@ def main() -> None:
     p.add_argument("--ai-model", default="Qwen/Qwen2.5-1.5B-Instruct")
     p.add_argument("--match-iters", type=int, default=48)
     p.add_argument("--match-seconds", type=float, default=3.0)
+    p.add_argument("--vocal-style", default="expressive contemporary lead vocal, intimate verses, stronger hook, clear words")
+    p.add_argument("--vocal-language", default="en")
+    p.add_argument("--vocal-steps", type=int, default=40)
     p.add_argument("--no-ai", action="store_true")
+    p.add_argument("--no-vocals", action="store_true")
     p.add_argument("--skip-sound-match", action="store_true")
     p.add_argument("--force-extract", action="store_true")
     p.add_argument("--force-sound-match", action="store_true")
@@ -44,19 +61,23 @@ def main() -> None:
     old_codec_index = work / "tokens-encodec24" / "index.jsonl"
     project = work / "ai_projects" / "latest"
     plan = project / "plan.json"
+    lyrics_json = project / "lyrics.json"
+    lyrics_txt = project / "lyrics.txt"
+    vocal_score = project / "vocal_score.json"
     arrangement = project / "arrangement.mid"
     matched = project / "matched_patches.json"
+    raw_vocal = project / "vocals" / "neural_lead_raw.wav"
 
-    for path in (audio, work, reference_dir, patch_cache, project):
+    for path in (audio, work, reference_dir, patch_cache, project, raw_vocal.parent):
         path.mkdir(parents=True, exist_ok=True)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU required for the Colab AI producer workflow.")
     print("GPU:", torch.cuda.get_device_name(0))
     print("Idea:", args.idea)
-    print("Sound engine: Musicm8 Synth v2 + Mix Polish")
+    print("Musicm8: Producer AI + Synth v2 + Neural Vocals")
 
-    print("\n=== 1/7 ANALYSE REFERENCE SONGS ===")
+    print("\n=== 1/11 ANALYSE REFERENCE SONGS ===")
     extract_cmd = [
         sys.executable, "-u", "daw_extract.py",
         "--audio-dir", audio,
@@ -70,7 +91,7 @@ def main() -> None:
     if not index.exists():
         raise RuntimeError(f"Missing DAW reference index: {index}")
 
-    print("\n=== 2/7 BUILD MULTIMODAL REFERENCE LIBRARY ===")
+    print("\n=== 2/11 BUILD MULTIMODAL REFERENCE LIBRARY ===")
     lib_cmd = [
         sys.executable, "-u", "reference_library.py",
         "--index", index,
@@ -80,7 +101,7 @@ def main() -> None:
         lib_cmd += ["--codec-index", old_codec_index]
     run(lib_cmd, repo)
 
-    print("\n=== 3/7 AI PRODUCER BRAIN ===")
+    print("\n=== 3/11 AI PRODUCER BRAIN ===")
     brain_cmd = [
         sys.executable, "-u", "producer_ai.py",
         "--idea", args.idea,
@@ -94,7 +115,30 @@ def main() -> None:
         brain_cmd.append("--no-ai")
     run(brain_cmd, repo)
 
-    print("\n=== 4/7 HIERARCHICAL CHORD-AWARE COMPOSITION ===")
+    if args.no_vocals:
+        print("\n=== 4/11 LYRICS ===")
+        lyrics_json.write_text(
+            json.dumps({"format": "musicm8-lyrics-v1", "title": "Instrumental", "language": args.vocal_language, "idea": args.idea, "hook": "", "sections": []}, indent=2),
+            encoding="utf-8",
+        )
+        lyrics_txt.write_text("[Instrumental]\n", encoding="utf-8")
+        print("⏭️ Vocals disabled; this run is instrumental.")
+    else:
+        print("\n=== 4/11 ORIGINAL AI LYRICS ===")
+        lyric_cmd = [
+            sys.executable, "-u", "lyrics_ai.py",
+            "--idea", args.idea,
+            "--plan", plan,
+            "--out", lyrics_json,
+            "--model", args.ai_model,
+            "--device", "cuda",
+            "--language", args.vocal_language,
+        ]
+        if args.no_ai:
+            lyric_cmd.append("--no-ai")
+        run(lyric_cmd, repo)
+
+    print("\n=== 5/11 HIERARCHICAL CHORD-AWARE COMPOSITION ===")
     run(
         [
             sys.executable, "-u", "plan_to_midi_v2.py",
@@ -105,7 +149,7 @@ def main() -> None:
         repo,
     )
 
-    print("\n=== 5/7 SYNTH V2 INVERSE SOUND DESIGN ===")
+    print("\n=== 6/11 SYNTH V2 INVERSE SOUND DESIGN ===")
     if args.skip_sound_match:
         matched.write_text(
             json.dumps(
@@ -134,7 +178,7 @@ def main() -> None:
             match_cmd.append("--force")
         run(match_cmd, repo)
 
-    print("\n=== 6/7 SYNTH V2 + FX + SIDECHAIN ===")
+    print("\n=== 7/11 SYNTH V2 + FX + SIDECHAIN ===")
     run(
         [
             sys.executable, "-u", "render_matched_v2.py",
@@ -146,7 +190,7 @@ def main() -> None:
         repo,
     )
 
-    print("\n=== 7/7 TONAL BALANCE + TRUE STEREO + MASTER POLISH ===")
+    print("\n=== 8/11 TONAL BALANCE + TRUE STEREO + MASTER POLISH ===")
     run(
         [
             sys.executable, "-u", "mix_polish_v2.py",
@@ -156,13 +200,75 @@ def main() -> None:
         repo,
     )
 
+    vocal_ok = False
+    vocal_error: str | None = None
+    if not args.no_vocals:
+        print("\n=== 9/11 ALIGN LYRICS TO VOCAL MELODY ===")
+        melody_midi = project / "midi_stems" / "melody.mid"
+        if melody_midi.exists():
+            run(
+                [
+                    sys.executable, "-u", "vocal_score.py",
+                    "--plan", plan,
+                    "--lyrics", lyrics_json,
+                    "--melody-midi", melody_midi,
+                    "--out", vocal_score,
+                ],
+                repo,
+            )
+        else:
+            print("⚠️ No melody MIDI was produced, so vocal score alignment is unavailable.")
+
+        print("\n=== 10/11 NEURAL SINGING VOICE (ACE-STEP 1.5) ===")
+        if raw_vocal.exists():
+            raw_vocal.unlink()
+        vocal_cmd = [
+            sys.executable, "-u", "neural_vocals.py",
+            "--repo", repo,
+            "--root", root,
+            "--backing", project / "master.wav",
+            "--lyrics", lyrics_txt,
+            "--plan", plan,
+            "--out", raw_vocal,
+            "--style", args.vocal_style,
+            "--language", args.vocal_language,
+            "--seed", str(args.seed),
+            "--steps", str(args.vocal_steps),
+        ]
+        vocal_ok, vocal_error = run_optional(vocal_cmd, repo, "Neural vocal generation")
+
+        print("\n=== 11/11 VOCAL FX + DOUBLES + FINAL MIX ===")
+        if vocal_ok and raw_vocal.exists():
+            run(
+                [
+                    sys.executable, "-u", "mix_vocals.py",
+                    "--project", project,
+                    "--vocal", raw_vocal,
+                    "--plan", plan,
+                    "--out", project / "master.wav",
+                ],
+                repo,
+            )
+        else:
+            print("⏭️ No neural vocal available; keeping the polished instrumental master.")
+    else:
+        print("\n=== 9-11/11 VOCALS DISABLED ===")
+
     payload = {
-        "format": "musicm8-ai-project-v3.1",
+        "format": "musicm8-ai-project-v4",
         "engine": "musicm8-synth-v2",
         "composer": "hierarchical-chord-aware-v2",
         "mix_engine": "musicm8-mix-polish-v1",
+        "vocal_engine": "ACE-Step-1.5 base Lego vocals" if not args.no_vocals else None,
         "idea": args.idea,
         "plan": str(plan),
+        "lyrics_json": str(lyrics_json),
+        "lyrics_text": str(lyrics_txt),
+        "vocal_score": str(vocal_score) if vocal_score.exists() else None,
+        "raw_neural_vocal": str(raw_vocal) if raw_vocal.exists() else None,
+        "vocals_dir": str(project / "vocals") if (project / "vocals").exists() else None,
+        "vocal_status": "ok" if vocal_ok else ("disabled" if args.no_vocals else "failed"),
+        "vocal_error": vocal_error,
         "reference_library": str(library),
         "arrangement_midi": str(arrangement),
         "midi_stems": str(project / "midi_stems"),
@@ -172,39 +278,33 @@ def main() -> None:
         "polished_audio_stems": str(project / "audio_stems_polished"),
         "synth_patches": str(project / "synth_patches.json"),
         "mix_report": str(project / "mix_report.json"),
-        "master_prepolish": str(project / "master_prepolish.wav"),
+        "vocal_mix_report": str(project / "vocal_mix_report.json") if (project / "vocal_mix_report.json").exists() else None,
+        "master_instrumental": str(project / "master_instrumental.wav") if (project / "master_instrumental.wav").exists() else str(project / "master.wav"),
         "master": str(project / "master.wav"),
         "legacy_codec_tokens": str(old_codec_index) if old_codec_index.exists() else None,
-        "sound_design": {
-            "learned_harmonic_wavetables": True,
-            "fm_layer": True,
-            "noise_texture_layer": True,
-            "per_drum_voice_analysis": True,
-            "multi_resolution_match": [512, 2048, 8192],
-            "eq": "3-band",
-            "compressor": True,
-            "kick_sidechain": True,
-            "true_stereo_polish": True,
-        },
         "note": (
-            "v3.1 keeps Synth v2 inverse matching but replaces the looser MIDI writer with a chord-aware hierarchical composer: "
-            "stable drum backbones, phrase fills, root/fifth bass logic, voice-led chords and repeated chord-tone melody motifs. "
-            "A final mix stage reduces excessive sub/bass dominance, high-passes non-bass parts, brings musical mids forward, and creates real stereo side information above the low-frequency mono region."
+            "Musicm8 v4 adds a dedicated vocal system. The producer AI writes an original section-aware lyric sheet, "
+            "lyrics are aligned to the generated melody as an editable vocal score, and ACE-Step 1.5's base-model Lego task "
+            "generates a vocals track in the context of Musicm8's own backing. A DAW-style vocal stage then high-passes, EQs, "
+            "de-esses, compresses, adds subtle stereo doubles/reverb/delay, ducks the backing lightly, and writes the complete master. "
+            "ACE-Step runs in an isolated Python 3.12 environment because the main Colab runtime may use Python 3.13; model weights are cached in Drive."
         ),
     }
     (project / "project.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    print("\n✅ MUSICM8 AI PRODUCER V3.1 COMPLETE")
+    print("\n✅ MUSICM8 AI PRODUCER V4 COMPLETE")
     print("Plan:", plan)
+    print("Lyrics:", lyrics_txt)
+    print("Vocal score:", vocal_score if vocal_score.exists() else "not available")
     print("MIDI:", arrangement)
-    print("MIDI stems:", project / "midi_stems")
-    print("Matched v2 patches:", matched)
-    print("A/B sound matches:", project / "sound_matches")
-    print("Raw audio stems:", project / "audio_stems")
-    print("Polished stems:", project / "audio_stems_polished")
-    print("Pre-polish master:", project / "master_prepolish.wav")
-    print("Final master:", project / "master.wav")
-    print("Mix report:", project / "mix_report.json")
+    print("Matched sound patches:", matched)
+    print("Instrument stems:", project / "audio_stems_polished")
+    if raw_vocal.exists():
+        print("Raw neural vocal:", raw_vocal)
+        print("Processed vocals:", project / "vocals")
+    print("Instrumental master:", project / "master_instrumental.wav" if (project / "master_instrumental.wav").exists() else project / "master.wav")
+    print("Final song master:", project / "master.wav")
+    print("Project:", project / "project.json")
 
 
 if __name__ == "__main__":
