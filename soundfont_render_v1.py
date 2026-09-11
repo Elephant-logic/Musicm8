@@ -16,6 +16,29 @@ import soundfile as sf
 SR = 44100
 ROLES = ("drums", "bass", "chords", "melody")
 
+# Zero-based General MIDI programs. MIDI-LLM still composes every note/rhythm;
+# this is the producer's instrument-choice stage so a random GM program does not
+# turn a garage/house track into accordion/brass/harpsichord by accident.
+STYLE_PROGRAMS: dict[str, dict[str, list[int]]] = {
+    "uk_garage": {"bass": [38, 39], "chords": [4, 89], "melody": [81, 80]},
+    "house": {"bass": [38, 33], "chords": [4, 89], "melody": [81, 80]},
+    "techno": {"bass": [38, 39], "chords": [89, 90], "melody": [81, 80]},
+    "dnb": {"bass": [38, 39], "chords": [89, 4], "melody": [81, 80]},
+    "trap": {"bass": [38, 39], "chords": [4, 5], "melody": [80, 81]},
+    "hiphop": {"bass": [33, 38], "chords": [4, 5], "melody": [80, 81]},
+    "ambient": {"bass": [33, 38], "chords": [89, 90], "melody": [88, 89]},
+    "electronic": {"bass": [38, 39], "chords": [4, 89], "melody": [81, 80]},
+}
+
+# Keep electronic kits to recognisable kick/snare/clap/hat/tom/cymbal voices.
+# MIDI-LLM occasionally emits bongos, whistles or other GM percussion that can
+# sound like a random late beat even when its timestamp is technically on-grid.
+CORE_ELECTRONIC_DRUMS = {
+    35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 55, 57,
+}
+
 
 def choose_soundfont(explicit: Path | None = None) -> Path:
     candidates: list[Path] = []
@@ -80,20 +103,21 @@ def render_midi(fluidsynth: str, soundfont: Path, midi: Path, wav: Path) -> None
 
 
 def _grid_start(t: float, bpm: float, swing: float) -> tuple[float, int]:
-    step = 60.0 / max(1.0, bpm) / 4.0  # sixteenth-note grid
+    step = 60.0 / max(1.0, bpm) / 4.0
     idx = max(0, int(round(float(t) / step)))
     start = idx * step + (step * swing if idx % 2 else 0.0)
     return float(start), idx
 
 
-def tighten_role_midi(path: Path, bpm: float, swing: float, role: str) -> dict[str, Any]:
-    """Rewrite one role stem onto the exact same musical clock used by every role.
+def program_for(style: str, role: str, index: int, original: int) -> int:
+    bank = STYLE_PROGRAMS.get(style, STYLE_PROGRAMS["electronic"]).get(role)
+    if not bank:
+        return int(original)
+    return int(bank[index % len(bank)])
 
-    MIDI-LLM remains the composer: pitches, instrument choices and rhythmic grid
-    positions are retained.  This pass only removes floating timing drift,
-    duplicate same-grid hits and invalid percussion notes before audio rendering.
-    The rewritten file is also what the vocal-score stage subsequently reads.
-    """
+
+def tighten_role_midi(path: Path, bpm: float, swing: float, role: str, style: str) -> dict[str, Any]:
+    """Put all role events on one exact clock and choose genre-coherent GM voices."""
     pm = pretty_midi.PrettyMIDI(str(path))
     out = pretty_midi.PrettyMIDI(initial_tempo=bpm)
     step = 60.0 / max(1.0, bpm) / 4.0
@@ -102,9 +126,13 @@ def tighten_role_midi(path: Path, bpm: float, swing: float, role: str) -> dict[s
     dropped = 0
     duplicates = 0
     max_shift_ms = 0.0
+    programs: list[int] = []
 
-    for src in pm.instruments:
-        dst = pretty_midi.Instrument(program=src.program, is_drum=src.is_drum, name=src.name)
+    for inst_index, src in enumerate(pm.instruments):
+        is_drum = bool(src.is_drum or role == "drums")
+        chosen_program = int(src.program) if is_drum else program_for(style, role, inst_index, int(src.program))
+        programs.append(chosen_program)
+        dst = pretty_midi.Instrument(program=chosen_program, is_drum=is_drum, name=src.name)
         seen: set[tuple[int, int]] = set()
         for n in sorted(src.notes, key=lambda x: (x.start, x.pitch, x.end)):
             start, idx = _grid_start(float(n.start), bpm, swing)
@@ -114,10 +142,11 @@ def tighten_role_midi(path: Path, bpm: float, swing: float, role: str) -> dict[s
                 corrected += 1
 
             pitch = int(n.pitch)
-            if role == "drums" or src.is_drum:
-                # GM percussion lives here. Stray notes outside the kit range can
-                # become bizarre pitched/percussive noises that sound like rogue beats.
+            if is_drum:
                 if not 35 <= pitch <= 81:
+                    dropped += 1
+                    continue
+                if style != "ambient" and pitch not in CORE_ELECTRONIC_DRUMS:
                     dropped += 1
                     continue
                 end = start + min(0.12, step * 0.85)
@@ -131,8 +160,11 @@ def tighten_role_midi(path: Path, bpm: float, swing: float, role: str) -> dict[s
                 duplicates += 1
                 continue
             seen.add(key)
+            velocity = int(np.clip(n.velocity, 1, 127))
+            if is_drum and pitch in {42, 44, 46, 51, 52, 55, 57}:
+                velocity = min(100, velocity)
             dst.notes.append(pretty_midi.Note(
-                velocity=int(np.clip(n.velocity, 1, 127)),
+                velocity=velocity,
                 pitch=pitch,
                 start=start,
                 end=max(start + 0.015, end),
@@ -141,9 +173,8 @@ def tighten_role_midi(path: Path, bpm: float, swing: float, role: str) -> dict[s
             out.instruments.append(dst)
 
     if not out.instruments:
-        raise RuntimeError(f"Timing guard removed every event from {path}")
+        raise RuntimeError(f"Timing/sound guard removed every event from {path}")
 
-    # Avoid same-pitch note overlap after exact quantisation.
     if role != "drums":
         for inst in out.instruments:
             by_pitch: dict[int, list[pretty_midi.Note]] = {}
@@ -160,14 +191,15 @@ def tighten_role_midi(path: Path, bpm: float, swing: float, role: str) -> dict[s
         "events": sum(len(i.notes) for i in out.instruments),
         "corrected": corrected,
         "duplicates_removed": duplicates,
-        "invalid_drum_notes_removed": dropped,
+        "unmusical_drum_events_removed": dropped,
         "max_start_correction_ms": round(max_shift_ms, 4),
         "grid": "shared 1/16 + shared swing",
+        "programs": programs,
     }
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Render Musicm8's learned multitrack MIDI using real sampled SoundFont instruments instead of the primitive oscillator engine.")
+    p = argparse.ArgumentParser(description="Render Musicm8's learned multitrack MIDI with style-directed sampled SoundFont instruments.")
     p.add_argument("--project", type=Path, required=True)
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--soundfont", type=Path, default=None)
@@ -183,21 +215,26 @@ def main() -> None:
         raise FileNotFoundError(stems_dir)
 
     bpm = float(plan.get("bpm", 120.0))
+    style = str(plan.get("style", "electronic"))
     swing = float(np.clip(float(plan.get("groove", {}).get("swing", 0.0)), 0.0, 0.20))
     timing_report: dict[str, Any] = {
-        "format": "musicm8-v10-render-clock-v1",
+        "format": "musicm8-v10-render-clock-v2",
         "bpm": bpm,
+        "style": style,
         "swing": swing,
         "roles": {},
-        "note": "MIDI-LLM composes the events. Immediately before audio rendering all roles are rewritten onto one shared sixteenth-note/swing clock, removing only timing drift, exact duplicates and invalid GM percussion notes.",
+        "note": "All learned MIDI roles are hard-locked to one sixteenth/swing clock. Style-directed GM programs prevent random instrument choices; non-core electronic percussion is removed before rendering.",
     }
     print("🥁 V10 RENDER CLOCK — hard-locking every stem to one shared groove")
     for role in ROLES:
         midi = stems_dir / f"{role}.mid"
         if midi.exists():
-            timing_report["roles"][role] = tighten_role_midi(midi, bpm, swing, role)
+            timing_report["roles"][role] = tighten_role_midi(midi, bpm, swing, role, style)
             info = timing_report["roles"][role]
-            print(f"   {role}: {info['events']} events | max correction {info['max_start_correction_ms']} ms")
+            print(
+                f"   {role}: {info['events']} events | max correction {info['max_start_correction_ms']} ms "
+                f"| programs={info['programs']}"
+            )
     (project / "render_timing_report.json").write_text(json.dumps(timing_report, indent=2), encoding="utf-8")
 
     fluidsynth = shutil.which("fluidsynth")
@@ -216,12 +253,13 @@ def main() -> None:
     shutil.rmtree(audio_dir, ignore_errors=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
-        "format": "musicm8-soundfont-render-v2",
-        "source": "sample-based GM SoundFont",
+        "format": "musicm8-soundfont-render-v3",
+        "source": "style-directed sample-based GM SoundFont",
+        "style": style,
         "soundfont": str(soundfont),
         "sample_rate": SR,
         "roles": {},
-        "timing": "All rendered role MIDIs are hard-locked to one shared 1/16/swing clock immediately before FluidSynth. No sample slicing, time-stretching or reference-loop placement is used.",
+        "timing": "All role MIDIs are hard-locked to one shared 1/16/swing clock immediately before FluidSynth; no sample slicing/time-stretching/reference-loop placement is used.",
         "timing_report": str(project / "render_timing_report.json"),
     }
     mix = np.zeros((2, total_n), dtype=np.float32)
@@ -250,6 +288,7 @@ def main() -> None:
                 "midi": str(midi),
                 "audio": str(out),
                 "peak": round(float(np.max(np.abs(x))), 5),
+                "programs": timing_report["roles"].get(role, {}).get("programs", []),
             }
 
     if not any(v.get("status") == "rendered" for v in report["roles"].values()):
@@ -264,7 +303,7 @@ def main() -> None:
     (project / "soundfont_render_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("✅ SAMPLE-BASED MULTITRACK RENDER")
-    print("✅ All stems rendered from the same hard-locked MIDI clock")
+    print("✅ Shared clock + style-directed instrument programs + cleaned electronic drum vocabulary")
     print("No reference stem chunks. No pitch-shifted old-song audio. No hand-built oscillator instruments in the audible source.")
     print("Audio stems:", audio_dir)
 
