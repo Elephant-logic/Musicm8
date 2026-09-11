@@ -23,12 +23,12 @@ def lcs_recall(expected: list[str], observed: list[str]) -> float:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Reject a Musicm8 vocal when a lightweight ASR cannot recover enough of the requested lyric words.")
+    p = argparse.ArgumentParser(description="Reject a Musicm8 vocal when ASR cannot recover enough of the requested lyric words.")
     p.add_argument("--vocal", type=Path, required=True)
     p.add_argument("--lyrics", type=Path, required=True)
     p.add_argument("--report", type=Path, required=True)
-    p.add_argument("--model", default="openai/whisper-tiny.en")
-    p.add_argument("--min-recall", type=float, default=0.34)
+    p.add_argument("--model", default="openai/whisper-base.en")
+    p.add_argument("--min-recall", type=float, default=0.55)
     args = p.parse_args()
 
     if not args.vocal.exists():
@@ -40,7 +40,9 @@ def main() -> None:
 
     device = 0 if torch.cuda.is_available() else -1
     dtype = torch.float16 if device == 0 else torch.float32
+    min_recall = max(0.55, float(args.min_recall))
     print("📝 Lyric intelligibility QA using", args.model)
+    print("Required ordered-word recall:", min_recall)
     asr = pipeline("automatic-speech-recognition", model=args.model, device=device, torch_dtype=dtype)
     result = asr(str(args.vocal), chunk_length_s=25, batch_size=4)
     transcript = str(result.get("text", "")).strip()
@@ -49,17 +51,19 @@ def main() -> None:
     observed = normalize(transcript)
     recall = lcs_recall(expected, observed)
     ratio = difflib.SequenceMatcher(a=" ".join(expected), b=" ".join(observed), autojunk=False).ratio() if expected else 1.0
-    passed = bool(recall >= float(args.min_recall) and len(observed) >= max(1, int(0.25 * len(expected))))
+    enough_words = len(observed) >= max(1, int(0.45 * len(expected)))
+    passed = bool(recall >= min_recall and enough_words)
 
     payload = {
-        "format": "musicm8-vocal-word-qa-v1",
+        "format": "musicm8-vocal-word-qa-v2",
         "pass": passed,
+        "minimum_ordered_word_recall": round(min_recall, 4),
         "expected_words": len(expected),
         "recognized_words": len(observed),
         "ordered_word_recall": round(recall, 4),
         "text_similarity": round(ratio, 4),
         "transcript": transcript,
-        "reason": "enough requested lyric words were recoverable" if passed else "too few requested lyric words were intelligible to ASR",
+        "reason": "requested lyrics are clearly recoverable" if passed else "lead is too hard to understand; it will not be mixed as a successful vocal",
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
