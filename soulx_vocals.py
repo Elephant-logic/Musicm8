@@ -9,8 +9,9 @@ import sys
 from pathlib import Path
 
 SOULX_REPO = "https://github.com/Soul-AILab/SoulX-Singer.git"
+SOULX_COMMIT = "81aeb3ae772c70093c3de74dc23c92d983801ae4"
 SOULX_MODEL_REPO = "Soul-AILab/SoulX-Singer"
-ENV_VERSION = "musicm8-soulx-env-v1"
+ENV_VERSION = "musicm8-soulx-env-v2"
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None, log: Path | None = None) -> subprocess.CompletedProcess:
@@ -31,9 +32,9 @@ def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None =
             f.write("\n$ " + " ".join(cmd) + "\n")
             f.write(text)
         if text:
-            print(text[-9000:], flush=True)
+            print(text[-10000:], flush=True)
     if proc.returncode != 0:
-        tail = "\n".join(text.splitlines()[-60:])
+        tail = "\n".join(text.splitlines()[-80:])
         raise RuntimeError(f"Command failed with exit {proc.returncode}: {' '.join(cmd)}\n--- backend tail ---\n{tail}")
     return proc
 
@@ -50,13 +51,12 @@ def ensure_uv() -> str:
 
 
 def ensure_source(root: Path, log: Path) -> None:
-    if (root / ".git").exists():
-        print("♻️ Refreshing SoulX-Singer source...")
-        run(["git", "-C", root, "fetch", "--depth", "1", "origin", "main"], log=log)
-        run(["git", "-C", root, "reset", "--hard", "origin/main"], log=log)
-    else:
+    if not (root / ".git").exists():
         shutil.rmtree(root, ignore_errors=True)
-        run(["git", "clone", "--depth", "1", SOULX_REPO, root], log=log)
+        run(["git", "clone", "--no-checkout", SOULX_REPO, root], log=log)
+    print("♻️ Pinning SoulX-Singer source to verified revision", SOULX_COMMIT[:12])
+    run(["git", "-C", root, "fetch", "--depth", "1", "origin", SOULX_COMMIT], log=log)
+    run(["git", "-C", root, "reset", "--hard", SOULX_COMMIT], log=log)
 
 
 def ensure_environment(uv: str, venv: Path, env: dict[str, str], log: Path) -> Path:
@@ -71,8 +71,17 @@ def ensure_environment(uv: str, venv: Path, env: dict[str, str], log: Path) -> P
     shutil.rmtree(venv, ignore_errors=True)
     run([uv, "venv", "--python", "3.10", venv], env=env, log=log)
 
+    # PyTorch CUDA wheels live on the PyTorch index, while normal dependencies live
+    # on PyPI. Supplying both avoids the common isolated-env failure where uv looks
+    # only at download.pytorch.org for packages such as filelock/typing-extensions.
     torch_index = "https://download.pytorch.org/whl/cu121"
-    run([uv, "pip", "install", "--python", py, "--index-url", torch_index, "torch==2.2.0", "torchaudio==2.2.0"], env=env, log=log)
+    run([
+        uv, "pip", "install", "--python", py,
+        "--index-url", torch_index,
+        "--extra-index-url", "https://pypi.org/simple",
+        "torch==2.2.0", "torchaudio==2.2.0",
+    ], env=env, log=log)
+
     packages = [
         "accelerate==1.11.0", "beartype==0.22.9", "einops==0.8.2", "g2p_en==2.1.0",
         "huggingface_hub>=0.20.0", "librosa==0.11.0", "loralib==0.1.2", "mido==1.3.3",
@@ -82,7 +91,15 @@ def ensure_environment(uv: str, venv: Path, env: dict[str, str], log: Path) -> P
         "soundfile==0.13.1", "tqdm==4.67.1", "transformers==4.41.2",
     ]
     run([uv, "pip", "install", "--python", py, *packages], env=env, log=log)
-    run([py, "-c", "import nltk; nltk.download('averaged_perceptron_tagger_eng', quiet=True); nltk.download('averaged_perceptron_tagger', quiet=True); nltk.download('cmudict', quiet=True); print('NLTK/g2p ready')"], env=env, log=log)
+    run([
+        py, "-c",
+        "import nltk; "
+        "nltk.download('averaged_perceptron_tagger_eng', quiet=True); "
+        "nltk.download('averaged_perceptron_tagger', quiet=True); "
+        "nltk.download('cmudict', quiet=True); "
+        "import torch, torchaudio, g2p_en, omegaconf; "
+        "print('SoulX env ready', torch.__version__, torchaudio.__version__)"
+    ], env=env, log=log)
     stamp.write_text(ENV_VERSION, encoding="utf-8")
     return py
 
@@ -143,8 +160,9 @@ def main() -> None:
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     status = {
-        "format": "musicm8-vocal-backend-status-v7",
+        "format": "musicm8-vocal-backend-status-v8",
         "backend": "SoulX-Singer",
+        "source_revision": SOULX_COMMIT,
         "mode": "score-conditioned",
         "success": False,
         "voice_clone": bool(args.voice_reference),
@@ -169,11 +187,15 @@ def main() -> None:
         prompt_meta = args.soulx_root / "example" / "audio" / "en_prompt.json"
         phoneset = args.soulx_root / "soulxsinger" / "utils" / "phoneme" / "phone_set.json"
         config = args.soulx_root / "soulxsinger" / "config" / "soulxsinger.yaml"
+        for required in (prompt_wav, prompt_meta, phoneset, config):
+            if not required.exists():
+                raise FileNotFoundError(required)
+
         save_dir = args.out.parent / "soulx_score_output"
         shutil.rmtree(save_dir, ignore_errors=True)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        print("\n🎤 SoulX-Singer: words + phonemes + exact MIDI score -> singing")
+        print("\n🎤 SoulX-Singer: exact words + phonemes + MIDI score -> singing")
         run([
             py, "-m", "cli.inference",
             "--device", "cuda",
@@ -189,8 +211,8 @@ def main() -> None:
         ], cwd=args.soulx_root, env=env, log=log)
 
         guide = save_dir / "generated.wav"
-        if not guide.exists():
-            raise FileNotFoundError(f"SoulX score inference did not create {guide}")
+        if not guide.exists() or guide.stat().st_size < 4096:
+            raise FileNotFoundError(f"SoulX score inference did not create a usable {guide}")
         guide_copy = args.out.parent / "soulx_score_guide.wav"
         shutil.copy2(guide, guide_copy)
 
@@ -209,7 +231,7 @@ def main() -> None:
                 "--out", cloned,
                 "--steps", str(args.svc_steps),
             ], cwd=args.soulx_root, env=env, log=log)
-            if not cloned.exists():
+            if not cloned.exists() or cloned.stat().st_size < 4096:
                 raise FileNotFoundError(cloned)
             final_source = cloned
             method = "soulx-score+svc"
@@ -227,11 +249,10 @@ def main() -> None:
         print("\n✅ SCORE-CONTROLLED SINGING CREATED")
         print("Method:", method)
         print("Vocal:", args.out)
-        print("No ACE-Step phrase stretching is used in this lead-vocal path.")
     except Exception as exc:
         status["errors"].append(str(exc))
         status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
-        tail = "\n".join(log.read_text(encoding="utf-8", errors="ignore").splitlines()[-100:]) if log.exists() else ""
+        tail = "\n".join(log.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:]) if log.exists() else ""
         print("\n================ SOULX VOCAL FAILURE ================")
         print(tail)
         print("=====================================================")
