@@ -26,14 +26,14 @@ def syllable_weight(word: str) -> float:
     count = max(1, len(groups))
     if w.endswith("e") and count > 1 and not w.endswith(("le", "ye")):
         count -= 1
-    return 1.0 + 0.28 * max(0, count - 1)
+    return 1.0 + 0.34 * max(0, count - 1)
 
 
 def section_windows(plan: dict[str, Any]) -> list[dict[str, Any]]:
     bpm = float(plan.get("bpm", 120.0))
     bar_s = 4.0 * 60.0 / max(1.0, bpm)
     cursor = 0.0
-    out = []
+    out: list[dict[str, Any]] = []
     for i, sec in enumerate(plan.get("sections", [])):
         bars = max(1, int(sec.get("bars", 1)))
         end = cursor + bars * bar_s
@@ -55,62 +55,160 @@ def scale_pcs(plan: dict[str, Any]) -> set[int]:
     return {(root + x) % 12 for x in SCALES.get(mode, SCALES["minor"])}
 
 
-def nearest_with_pcs(target: int, pcs: set[int], lo: int = 57, hi: int = 81) -> int:
-    pool = [p for p in range(lo, hi + 1) if p % 12 in pcs]
-    if not pool:
-        return int(np.clip(target, lo, hi))
-    return min(pool, key=lambda p: (abs(p - target), p))
-
-
 def pitched_notes(pm: pretty_midi.PrettyMIDI | None) -> list[pretty_midi.Note]:
     if pm is None:
         return []
-    return [n for inst in pm.instruments if not inst.is_drum for n in inst.notes]
+    return sorted(
+        [n for inst in pm.instruments if not inst.is_drum for n in inst.notes],
+        key=lambda n: (n.start, n.pitch, n.end),
+    )
 
 
-def active_pcs(notes: list[pretty_midi.Note], t: float, search_s: float = 0.55) -> set[int]:
-    active = [n for n in notes if n.start - 0.03 <= t <= n.end + 0.03]
-    if not active and notes:
+def harmony_pcs_at(notes: list[pretty_midi.Note], t: float, beat: float) -> set[int]:
+    if not notes:
+        return set()
+    active = [n for n in notes if n.start - 0.06 <= t <= n.end + 0.06]
+    if len({n.pitch % 12 for n in active}) < 2:
+        local = [n for n in notes if abs(n.start - t) <= max(0.25, 0.85 * beat)]
+        active.extend(local)
+    if not active:
         near = sorted(notes, key=lambda n: min(abs(t - n.start), abs(t - n.end)))[:8]
-        active = [n for n in near if min(abs(t - n.start), abs(t - n.end)) <= search_s]
+        active = [n for n in near if min(abs(t - n.start), abs(t - n.end)) <= 1.5 * beat]
     return {int(n.pitch) % 12 for n in active}
 
 
-def melody_target(notes: list[pretty_midi.Note], t: float, default: int) -> int:
-    active = [n.pitch for n in notes if n.start - 0.04 <= t <= n.end + 0.04]
-    if active:
-        return int(round(float(np.median(active))))
-    if notes:
-        near = min(notes, key=lambda n: min(abs(t - n.start), abs(t - n.end)))
-        if min(abs(t - near.start), abs(t - near.end)) <= 0.8:
+def collapse_melody_events(notes: list[pretty_midi.Note], a: float, b: float) -> list[pretty_midi.Note]:
+    local = [n for n in notes if a - 0.04 <= n.start < b + 0.04]
+    if not local:
+        return []
+    groups: list[list[pretty_midi.Note]] = []
+    for n in local:
+        if not groups or abs(n.start - groups[-1][0].start) > 0.035:
+            groups.append([n])
+        else:
+            groups[-1].append(n)
+    out: list[pretty_midi.Note] = []
+    for g in groups:
+        # Prefer a clear top-line note: higher register, then velocity and duration.
+        out.append(max(g, key=lambda n: (n.pitch, n.velocity, n.end - n.start)))
+    return out
+
+
+def nearest_allowed_pitch(target: int, pcs: set[int], previous: int | None, lo: int = 59, hi: int = 79) -> int:
+    pool = [p for p in range(lo, hi + 1) if p % 12 in pcs]
+    if not pool:
+        return int(np.clip(target, lo, hi))
+
+    def cost(p: int) -> float:
+        c = abs(p - target)
+        if previous is not None:
+            leap = abs(p - previous)
+            c += 0.32 * leap
+            if leap > 7:
+                c += 3.0 + 0.8 * (leap - 7)
+        return c
+
+    return int(min(pool, key=cost))
+
+
+def source_pitch_at(events: list[pretty_midi.Note], t: float, previous: int | None) -> int:
+    if events:
+        near = min(events, key=lambda n: abs(n.start - t))
+        if abs(near.start - t) <= 1.0:
             return int(near.pitch)
-    return default
+    return int(previous if previous is not None else 67)
 
 
-def choose_pitch(
-    plan: dict[str, Any],
-    harmony_notes: list[pretty_midi.Note],
-    melody_notes: list[pretty_midi.Note],
-    t: float,
-    contour: int,
-    previous: int | None,
-    strong: bool,
-) -> int:
-    scale = scale_pcs(plan)
-    harmony = active_pcs(harmony_notes, t)
-    fallback = 66 + contour
-    target = melody_target(melody_notes, t, fallback) + (0 if melody_notes else contour)
-    allowed = harmony if strong and harmony else scale
-    pitch = nearest_with_pcs(target, allowed)
-    if previous is not None:
-        while pitch - previous > 7:
-            pitch -= 12
-        while previous - pitch > 7:
-            pitch += 12
-        pitch = int(np.clip(pitch, 57, 81))
-        if pitch % 12 not in allowed:
-            pitch = nearest_with_pcs(pitch, allowed)
-    return pitch
+def lyrics_for_section(lyrics: dict[str, Any], sec: dict[str, Any], index: int) -> list[str]:
+    lyric_sections = lyrics.get("sections", []) if isinstance(lyrics.get("sections", []), list) else []
+    if index < len(lyric_sections) and isinstance(lyric_sections[index], dict):
+        lines = [str(x).strip() for x in lyric_sections[index].get("lines", []) if str(x).strip()]
+        if lines:
+            return lines
+    wanted = re.sub(r"[^a-z0-9]", "", str(sec.get("name", "")).lower())
+    for item in lyric_sections:
+        if not isinstance(item, dict):
+            continue
+        got = re.sub(r"[^a-z0-9]", "", str(item.get("name", item.get("section", ""))).lower())
+        if got and got == wanted:
+            return [str(x).strip() for x in item.get("lines", []) if str(x).strip()]
+    return []
+
+
+def line_windows(sec: dict[str, Any], lines: list[str], beat: float) -> list[tuple[float, float]]:
+    if not lines:
+        return []
+    margin = max(0.18, 0.50 * beat)
+    gap = max(0.14, 0.42 * beat)
+    a = sec["start"] + margin
+    b = sec["end"] - margin
+    available = max(0.4, b - a - gap * max(0, len(lines) - 1))
+    desired = []
+    for line in lines:
+        ws = words(line)
+        syll = sum(syllable_weight(w) for w in ws)
+        # Aim for recognisable consonants/vowels rather than cramming words into tiny notes.
+        wanted = max(2.2 * beat, 0.30 * len(ws) + 0.08 * syll + 0.15)
+        desired.append(wanted)
+    total = sum(desired) or available
+    if total > available:
+        scale = available / total
+        desired = [max(1.55 * beat, x * scale) for x in desired]
+        if sum(desired) > available:
+            scale = available / max(sum(desired), 1e-6)
+            desired = [x * scale for x in desired]
+
+    eighth = beat * 0.5
+    cursor = a
+    out: list[tuple[float, float]] = []
+    for dur in desired:
+        start = round(cursor / eighth) * eighth
+        start = max(a, start)
+        end = min(b, start + dur)
+        if end - start < max(0.38, 1.15 * beat):
+            end = min(b, start + max(0.38, 1.15 * beat))
+        out.append((start, end))
+        cursor = end + gap
+    return out
+
+
+def choose_word_starts(
+    events: list[pretty_midi.Note],
+    line_start: float,
+    line_end: float,
+    count: int,
+    beat: float,
+) -> list[float]:
+    if count <= 0:
+        return []
+    local = collapse_melody_events(events, line_start, line_end)
+    if len(local) >= count:
+        idxs = np.linspace(0, len(local) - 1, count)
+        starts = [float(local[int(round(i))].start) for i in idxs]
+    else:
+        span = max(0.2, line_end - line_start)
+        starts = [line_start + span * i / count for i in range(count)]
+        eighth = beat * 0.5
+        starts = [round(x / eighth) * eighth for x in starts]
+        # Pull planned starts toward nearby AI-composed lead onsets when possible.
+        used: set[int] = set()
+        for i, t in enumerate(starts):
+            if local:
+                candidates = [(j, n) for j, n in enumerate(local) if j not in used]
+                if candidates:
+                    j, n = min(candidates, key=lambda item: abs(item[1].start - t))
+                    if abs(n.start - t) <= 0.45 * beat:
+                        starts[i] = float(n.start)
+                        used.add(j)
+    starts = sorted(max(line_start, min(line_end - 0.12, float(x))) for x in starts)
+    # Guarantee forward motion after quantisation/snapping.
+    min_gap = max(0.10, 0.28 * beat)
+    for i in range(1, len(starts)):
+        starts[i] = max(starts[i], starts[i - 1] + min_gap)
+    if starts and starts[-1] > line_end - 0.12:
+        shift = starts[-1] - (line_end - 0.12)
+        starts = [max(line_start, x - shift) for x in starts]
+    return starts
 
 
 def build(
@@ -121,79 +219,118 @@ def build(
 ) -> tuple[pretty_midi.PrettyMIDI, dict[str, Any]]:
     bpm = float(plan.get("bpm", 120.0))
     beat = 60.0 / max(1.0, bpm)
-    pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
-    inst = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Voice Oohs"), name="vocal_melody")
+    scale = scale_pcs(plan)
     harmony_notes = pitched_notes(harmony_pm)
     melody_notes = pitched_notes(melody_pm)
-    lyric_sections = lyrics.get("sections", []) if isinstance(lyrics.get("sections", []), list) else []
+
+    pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+    inst = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Voice Oohs"), name="vocal_melody")
     previous: int | None = None
-    scored_sections = []
-    contour_bank = [0, 2, 1, 3, 2, 0, -1, 1, 0, -2, 0, 2, 1, -1, 0, 1]
+    scored_sections: list[dict[str, Any]] = []
+    harmonic_checked = 0
+    harmonic_good = 0
 
     for si, sec in enumerate(section_windows(plan)):
-        lines = []
-        if si < len(lyric_sections) and isinstance(lyric_sections[si], dict):
-            lines = [str(x).strip() for x in lyric_sections[si].get("lines", []) if str(x).strip()]
+        lines = lyrics_for_section(lyrics, sec, si)
         notes_out: list[dict[str, Any]] = []
-        if lines:
-            margin = min(0.28 * beat, max(0.04, (sec["end"] - sec["start"]) * 0.02))
-            a = sec["start"] + margin
-            b = sec["end"] - margin
-            line_weights = [max(2.0, sum(syllable_weight(w) for w in words(line))) for line in lines]
-            total_lw = sum(line_weights) or float(len(lines))
-            cursor = a
-            for li, (line, lw) in enumerate(zip(lines, line_weights)):
-                line_end = b if li == len(lines) - 1 else cursor + (b - a) * lw / total_lw
-                line_end = min(b, line_end)
-                gap = min(0.28 * beat, max(0.05, (line_end - cursor) * 0.06))
-                phrase_end = max(cursor + 0.12, line_end - (gap if li < len(lines) - 1 else 0.0))
-                ws = words(line)
-                weights = [syllable_weight(w) for w in ws]
-                gap_w = 0.18
-                total = sum(weights) + gap_w * max(0, len(ws) - 1)
-                unit = max(0.01, (phrase_end - cursor) / max(total, 1e-6))
-                pos = cursor
-                for wi, (word, ww) in enumerate(zip(ws, weights)):
-                    remaining = len(ws) - wi - 1
-                    dur = max(0.12, unit * ww)
-                    latest = phrase_end - remaining * 0.11
-                    end = max(pos + 0.09, min(latest, pos + dur))
-                    strong = wi == 0 or wi == len(ws) - 1 or wi % 4 == 0
-                    contour = contour_bank[(wi + li * 3 + si * 2) % len(contour_bank)]
-                    pitch = choose_pitch(plan, harmony_notes, melody_notes, pos, contour, previous, strong)
+        windows = line_windows(sec, lines, beat)
+
+        for li, (line, (line_start, line_end)) in enumerate(zip(lines, windows)):
+            ws = words(line)
+            if not ws:
+                continue
+            starts = choose_word_starts(melody_notes, line_start, line_end, len(ws), beat)
+            local_melody = collapse_melody_events(melody_notes, line_start, line_end)
+
+            for wi, (word, start) in enumerate(zip(ws, starts)):
+                next_start = starts[wi + 1] if wi + 1 < len(starts) else line_end
+                gap = min(0.06, 0.10 * beat)
+                word_end = max(start + 0.18, next_start - gap)
+                word_end = min(line_end, word_end)
+                if word_end <= start + 0.11:
+                    word_end = min(line_end, start + 0.16)
+
+                target = source_pitch_at(local_melody, start, previous)
+                pcs = harmony_pcs_at(harmony_notes, start, beat) if harmony_notes else scale
+                allowed = pcs or scale
+                pitch = nearest_allowed_pitch(target, allowed, previous)
+
+                # Long/multi-syllable phrase-ending words may naturally span a second
+                # note when the AI lead itself moves inside that word window.
+                split_event: pretty_midi.Note | None = None
+                if (syllable_weight(word) > 1.12 or wi == len(ws) - 1) and word_end - start >= 0.48:
+                    later = [n for n in local_melody if start + 0.16 <= n.start <= word_end - 0.14]
+                    if later:
+                        split_event = later[0]
+
+                segments: list[tuple[float, float, int, int]] = []
+                if split_event is not None:
+                    split = float(split_event.start)
+                    first_end = max(start + 0.14, split - 0.02)
+                    if first_end < word_end - 0.12:
+                        segments.append((start, first_end, pitch, 2))
+                        pcs2 = harmony_pcs_at(harmony_notes, split, beat) if harmony_notes else scale
+                        pitch2 = nearest_allowed_pitch(int(split_event.pitch), pcs2 or scale, pitch)
+                        segments.append((split, word_end, pitch2, 3))
+                    else:
+                        segments.append((start, word_end, pitch, 2))
+                else:
+                    segments.append((start, word_end, pitch, 2))
+
+                for part_index, (a, b, p, note_type) in enumerate(segments):
+                    context = harmony_pcs_at(harmony_notes, a, beat) if harmony_notes else set()
+                    if context:
+                        harmonic_checked += 1
+                        harmonic_good += int(p % 12 in context)
                     row = {
-                        "start": round(pos, 5), "end": round(end, 5), "duration": round(end - pos, 5),
-                        "pitch": int(pitch), "velocity": 84 if strong else 76,
-                        "word": word, "syllable": word, "line_index": li, "word_index": wi, "note_type": 2,
-                        "harmony_pitch_classes": sorted(active_pcs(harmony_notes, pos)),
+                        "start": round(a, 5),
+                        "end": round(b, 5),
+                        "duration": round(b - a, 5),
+                        "pitch": int(p),
+                        "velocity": 84 if wi in {0, len(ws) - 1} else 77,
+                        "word": word,
+                        "syllable": word,
+                        "line_index": li,
+                        "word_index": wi,
+                        "note_type": int(note_type),
+                        "word_part": part_index,
+                        "harmony_pitch_classes": sorted(context),
                     }
                     notes_out.append(row)
                     inst.notes.append(pretty_midi.Note(row["velocity"], row["pitch"], row["start"], row["end"]))
-                    previous = pitch
-                    pos = end
-                    if wi < len(ws) - 1:
-                        pos = min(phrase_end - remaining * 0.09, pos + max(0.025, unit * gap_w))
-                cursor = line_end
+                    previous = int(p)
+
         scored_sections.append({**sec, "lines": lines, "notes": notes_out})
 
+    if not inst.notes:
+        raise RuntimeError("No lyric note events were created for the vocal score")
     pm.instruments.append(inst)
+    harmony_fit = harmonic_good / harmonic_checked if harmonic_checked else None
+    if harmony_notes and harmonic_checked and harmony_fit is not None and harmony_fit < 0.96:
+        raise RuntimeError(f"Vocal harmony guard failed before synthesis: fit={harmony_fit:.3f}")
+
     payload = {
-        "format": "musicm8-vocal-score-ai-arrangement-v1",
+        "format": "musicm8-vocal-score-ai-arrangement-v2",
         "title": lyrics.get("title", "Musicm8 Song"),
         "language": lyrics.get("language", "en"),
         "bpm": bpm,
         "key_root": int(plan.get("key_root", 0)),
         "mode": str(plan.get("mode", "minor")),
         "sections": scored_sections,
-        "harmony_source": "actual learned AI chord MIDI" if harmony_notes else "song key fallback",
-        "melodic_contour_source": "actual learned AI lead MIDI" if melody_notes else "generated singable contour",
-        "note": "Words are timed inside the planned song sections, while pitches are anchored to the harmony and lead actually composed by MIDI-LLM. Strong words use active chord pitch classes; intervals are leap-limited for singability.",
+        "harmony_source": "actual tightened AI chord MIDI" if harmony_notes else "song-key fallback",
+        "rhythm_source": "actual tightened AI lead onsets with lyric-friendly phrase spacing" if melody_notes else "shared beat grid",
+        "harmony_fit": None if harmony_fit is None else round(float(harmony_fit), 4),
+        "harmonic_events_checked": harmonic_checked,
+        "note": (
+            "Vocal timing is no longer free-running across a section. Each lyric line gets breathing space, word onsets follow the actual AI lead rhythm when available, "
+            "and every scored pitch is projected into the active harmony before SoulX sees it. Long words only use melisma when the AI lead itself moves inside that word."
+        ),
     }
     return pm, payload
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Build a word-by-word lead vocal score that follows Musicm8's actual learned AI arrangement.")
+    p = argparse.ArgumentParser(description="Build a natural, harmony-locked lead vocal score from Musicm8's actual AI arrangement.")
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--lyrics", type=Path, required=True)
     p.add_argument("--harmony-midi", type=Path, default=None)
@@ -213,10 +350,11 @@ def main() -> None:
     score["melody_midi"] = str(args.midi_out)
     args.score_out.write_text(json.dumps(score, indent=2, ensure_ascii=False), encoding="utf-8")
     count = sum(len(s["notes"]) for s in score["sections"])
-    print("✅ AI-ARRANGEMENT VOCAL SCORE:", args.score_out)
-    print("Word-note events:", count)
+    print("✅ NATURAL HARMONY-LOCKED VOCAL SCORE:", args.score_out)
+    print("Word/note events:", count)
     print("Harmony source:", score["harmony_source"])
-    print("Melodic contour source:", score["melodic_contour_source"])
+    print("Rhythm source:", score["rhythm_source"])
+    print("Harmony fit:", score["harmony_fit"])
 
 
 if __name__ == "__main__":
