@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,14 @@ def main() -> None:
     p.add_argument("--device", default="cuda")
     p.add_argument("--fp16", action="store_true")
     args = p.parse_args()
+
+    # This script is stored in /content/Musicm8 but is launched with cwd set to
+    # /content/SoulX-Singer. Python otherwise puts the script directory first and
+    # may not discover the sibling SoulX source checkout. The parent runner also
+    # sets PYTHONPATH; this local guard makes the import robust on its own.
+    cwd = str(Path.cwd().resolve())
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
 
     from soulxsinger.models.soulxsinger import SoulXSinger
     from soulxsinger.utils.data_processor import DataProcessor
@@ -90,9 +99,6 @@ def main() -> None:
         y = audio.squeeze().float().cpu().numpy().astype(np.float32)
         generated_n = int(len(y))
 
-        # SoulX's vocoder can return a few extra samples beyond the metadata duration.
-        # Never let those samples spill into the next lyric phrase. We trim/pad only at
-        # the chunk boundary; we do NOT time-stretch the words after generation.
         if len(y) > target_n:
             y = y[:target_n]
         elif len(y) < target_n:
@@ -123,11 +129,11 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     sf.write(args.out, mix, sr, subtype="PCM_24")
     args.out.with_suffix(".chunks.json").write_text(json.dumps({
-        "format": "musicm8-soulx-chunk-stitch-v1",
+        "format": "musicm8-soulx-chunk-stitch-v2",
         "sample_rate": sr,
         "chunks": report,
-        "method": "phrase chunks + exact timestamp placement + overlap-add edge fades + no post-hoc word stretching",
-        "note": "Each lyric phrase is generated independently. Extra vocoder tail is contained inside its own phrase window so it cannot overwrite the next phrase, and adjacent phrase edges are overlap-added to avoid hard clicks/clips.",
+        "method": "short musical phrase chunks + exact timestamp placement + overlap-add edge fades + no post-hoc word stretching",
+        "note": "Each short lyric phrase is generated independently. Excess vocoder tail cannot overwrite the next phrase, and phrase edges are softened without stretching the words.",
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     print("✅ Clip-safe chunked SoulX vocal:", args.out)
 
