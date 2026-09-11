@@ -183,6 +183,22 @@ def main() -> None:
     print("Spectrum:",report["spectrum"])
     print("Stereo:",report["stereo"])
 
+    # Final conservative production pass: compare this master with the selected reference songs
+    # and nudge broad tonal balance toward their median. Corrections are capped at ±2 dB.
+    try:
+        work = project.parents[1]
+        references = work / "reference_library" / "library.json"
+        if references.exists():
+            from reference_master import reference_master
+            rr = reference_master(Path(out), args.plan, references, Path(out))
+            print("✅ Reference-aware final master")
+            print("References:", rr.get("references"))
+            print("EQ correction dB:", rr.get("eq_correction_db"))
+        else:
+            print("⚠️ Reference-aware master skipped: reference library not found")
+    except Exception as exc:
+        print(f"⚠️ Reference-aware master failed safely ({exc}); keeping genre mix v3 output.")
+
 
 if __name__ == "__main__":
     main()
