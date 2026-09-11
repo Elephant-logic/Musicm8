@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -70,12 +71,19 @@ def main() -> None:
     if not backing.exists():
         raise FileNotFoundError(f"Missing instrumental/master: {backing}")
 
+    # Guarantee Musicm8's sitecustomize compatibility hook is visible inside
+    # every nested ACE-Step/uv Python process. On a Tesla T4 that hook forces
+    # float32 diffusion (to prevent NaN latents) and enables CPU offload.
+    old_pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = str(repo) + (os.pathsep + old_pythonpath if old_pythonpath else "")
+
     raw_vocal.parent.mkdir(parents=True, exist_ok=True)
     print("🎤 MUSICM8 VOCAL-ONLY RETRY")
     print("Backing:", backing)
     print("Lyrics :", lyrics)
     print("Plan   :", plan)
     print("Log    :", backend_log)
+    print("T4 compatibility hook:", repo / "sitecustomize.py")
 
     run([
         sys.executable, "-u", "neural_vocals.py",
