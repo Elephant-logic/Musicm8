@@ -26,23 +26,19 @@ def run(cmd: list[str], cwd: Path, *, show_failure_log: Path | None = None) -> N
             print("\n--- LAST 180 LOG LINES ---")
             print("\n".join(lines[-180:]))
             print("--- END LOG ---")
-        else:
-            print("No backend log was found.")
-        raise RuntimeError(
-            f"Command failed with exit code {proc.returncode}. "
-            "The real backend error is printed above; do not rely on the outer CalledProcessError."
-        )
+        raise RuntimeError(f"Command failed with exit code {proc.returncode}. The real backend error is printed above.")
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Retry only the Musicm8 vocal stage using the existing instrumental, lyrics and melody.")
+    p = argparse.ArgumentParser(description="Retry only Musicm8 v8 score-controlled SoulX vocals on the existing instrumental.")
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent)
-    p.add_argument("--style", default="expressive contemporary lead vocal, intimate verses, emotional hook, clear lyrics")
+    p.add_argument("--style", default="expressive contemporary lead vocal")
     p.add_argument("--language", default="en")
-    p.add_argument("--steps", type=int, default=32)
+    p.add_argument("--steps", type=int, default=24)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--reuse-raw", action="store_true", help="Do not regenerate ACE-Step; resync the existing raw vocal only.")
+    p.add_argument("--voice-reference", type=Path, default=None)
+    p.add_argument("--reuse-raw", action="store_true", help="Reuse the existing SoulX raw vocal and rerun only QA/mixing.")
     args = p.parse_args()
 
     root = args.root.resolve()
@@ -51,95 +47,89 @@ def main() -> None:
     lyrics_txt = project / "lyrics.txt"
     lyrics_json = project / "lyrics.json"
     plan = project / "plan.json"
-    melody_midi = project / "midi_stems" / "melody.mid"
     vocal_score = project / "vocal_score.json"
+    vocal_midi = project / "vocal_melody.mid"
     raw_vocal = project / "vocals" / "neural_lead_raw.wav"
     synced_vocal = project / "vocals" / "neural_lead_synced.wav"
+    pitch_quality = project / "vocals" / "vocal_quality.json"
+    word_quality = project / "vocals" / "vocal_word_quality.json"
     instrumental = project / "master_instrumental.wav"
     master = project / "master.wav"
     backend_log = project / "vocals" / "vocal_backend.log"
 
-    for path in (project, lyrics_txt, lyrics_json, plan, melody_midi):
+    for path in (project, lyrics_txt, lyrics_json, plan):
         if not path.exists():
             raise FileNotFoundError(path)
-
     backing = instrumental if instrumental.exists() else master
     if not backing.exists():
         raise FileNotFoundError(f"Missing instrumental/master: {backing}")
+    if args.voice_reference is not None and not args.voice_reference.exists():
+        raise FileNotFoundError(args.voice_reference)
 
     old_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = str(repo) + (os.pathsep + old_pythonpath if old_pythonpath else "")
-
     raw_vocal.parent.mkdir(parents=True, exist_ok=True)
-    print("🎤 MUSICM8 VOCAL SYNC RETRY")
+
+    print("🎤 MUSICM8 V8 VOCAL-ONLY RETRY")
     print("Backing:", backing)
     print("Lyrics :", lyrics_txt)
-    print("Melody :", melody_midi)
     print("Plan   :", plan)
-    print("Log    :", backend_log)
-    print("T4 compatibility hook:", repo / "sitecustomize.py")
+    print("Voice reference:", args.voice_reference or "default SoulX prompt singer")
+    print("\n================ 📝 LYRICS USED ================\n")
+    print(lyrics_txt.read_text(encoding="utf-8", errors="ignore"))
+    print("=================================================\n")
 
-    # Rebuild the score using the current v2 alignment so every note knows which
-    # lyric line it belongs to. This is fast and fixes old projects automatically.
     run([
-        sys.executable, "-u", "vocal_score.py",
+        sys.executable, "-u", "vocal_lead_score.py",
         "--plan", plan,
         "--lyrics", lyrics_json,
-        "--melody-midi", melody_midi,
-        "--out", vocal_score,
+        "--midi-out", vocal_midi,
+        "--score-out", vocal_score,
     ], repo)
-
-    print("\n📝 LYRICS")
-    print(lyrics_txt.read_text(encoding="utf-8", errors="ignore"))
 
     if not args.reuse_raw:
-        run([
-            sys.executable, "-u", "neural_vocals.py",
+        for stale in (raw_vocal, synced_vocal):
+            if stale.exists():
+                stale.unlink()
+        cmd = [
+            sys.executable, "-u", "soulx_vocals.py",
             "--repo", repo,
             "--root", root,
-            "--backing", backing,
-            "--lyrics", lyrics_txt,
-            "--plan", plan,
+            "--score", vocal_score,
             "--out", raw_vocal,
-            "--style", args.style,
-            "--language", args.language,
-            "--seed", str(args.seed),
-            "--steps", str(args.steps),
-        ], repo, show_failure_log=backend_log)
+            "--svc-steps", str(max(8, min(40, args.steps))),
+        ]
+        if args.voice_reference is not None:
+            cmd += ["--voice-reference", args.voice_reference]
+        run(cmd, repo, show_failure_log=backend_log)
     elif not raw_vocal.exists():
-        raise FileNotFoundError(f"--reuse-raw requested but raw vocal is missing: {raw_vocal}")
+        raise FileNotFoundError(f"--reuse-raw requested but raw SoulX vocal is missing: {raw_vocal}")
     else:
-        print("♻️ Reusing existing raw neural vocal; ACE-Step will NOT run again.")
+        print("♻️ Reusing existing SoulX raw vocal; no singer generation will run.")
 
-    # The neural singer is creative and can drift against the arrangement. The score
-    # is authoritative: trim model padding, map phrases in lyric order, preserve pitch
-    # while time-fitting each phrase to its written note window, and gently correct
-    # each phrase toward the melody's key/average pitch.
-    run([
-        sys.executable, "-u", "vocal_sync.py",
-        "--vocal", raw_vocal,
-        "--score", vocal_score,
-        "--out", synced_vocal,
-    ], repo)
+    shutil.copy2(raw_vocal, synced_vocal)
 
-    if backing != master:
-        shutil.copy2(backing, master)
+    try:
+        run([sys.executable, "-u", "vocal_quality_gate.py", "--vocal", synced_vocal, "--score", vocal_score, "--report", pitch_quality], repo)
+        run([sys.executable, "-u", "vocal_word_gate.py", "--vocal", synced_vocal, "--lyrics", lyrics_txt, "--report", word_quality], repo)
+    except Exception:
+        if instrumental.exists():
+            shutil.copy2(instrumental, master)
+        print("❌ Vocal failed pitch/word QA. The instrumental master has been restored.")
+        raise
 
-    run([
-        sys.executable, "-u", "mix_vocals.py",
-        "--project", project,
-        "--vocal", synced_vocal,
-        "--plan", plan,
-        "--out", master,
-    ], repo)
+    if instrumental.exists():
+        shutil.copy2(instrumental, master)
+    run([sys.executable, "-u", "mix_vocals.py", "--project", project, "--vocal", synced_vocal, "--plan", plan, "--out", master], repo)
 
     status_path = project / "vocals" / "vocal_status.json"
     status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
-    print("\n✅ VOCAL SYNC COMPLETE")
-    print("Neural method:", status.get("method", "ACE-Step"))
-    print("Raw vocal:", raw_vocal)
-    print("Score-locked vocal:", synced_vocal)
-    print("Vocal mix:", project / "vocals" / "vocal_mix.wav")
+    print("\n✅ SCORE-CONTROLLED VOCAL COMPLETE")
+    print("Method:", status.get("method", "SoulX-Singer"))
+    print("Vocal melody:", vocal_midi)
+    print("Raw/score vocal:", raw_vocal)
+    print("Pitch QA:", pitch_quality)
+    print("Word QA:", word_quality)
     print("Final song:", master)
 
 
