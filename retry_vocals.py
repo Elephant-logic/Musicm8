@@ -29,8 +29,15 @@ def run(cmd: list[str], cwd: Path, *, show_failure_log: Path | None = None) -> N
         raise RuntimeError(f"Command failed with exit code {proc.returncode}. The real backend error is printed above.")
 
 
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        return {}
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Retry only Musicm8 v8 score-controlled SoulX vocals on the existing instrumental.")
+    p = argparse.ArgumentParser(description="Retry only Musicm8 v9 score-controlled SoulX vocals on the existing instrumental.")
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent)
     p.add_argument("--style", default="expressive contemporary lead vocal")
@@ -56,6 +63,7 @@ def main() -> None:
     instrumental = project / "master_instrumental.wav"
     master = project / "master.wav"
     backend_log = project / "vocals" / "vocal_backend.log"
+    final_status = project / "final_status.json"
 
     for path in (project, lyrics_txt, lyrics_json, plan):
         if not path.exists():
@@ -70,7 +78,7 @@ def main() -> None:
     os.environ["PYTHONPATH"] = str(repo) + (os.pathsep + old_pythonpath if old_pythonpath else "")
     raw_vocal.parent.mkdir(parents=True, exist_ok=True)
 
-    print("🎤 MUSICM8 V8 VOCAL-ONLY RETRY")
+    print("🎤 MUSICM8 V9 VOCAL-ONLY RETRY")
     print("Backing:", backing)
     print("Lyrics :", lyrics_txt)
     print("Plan   :", plan)
@@ -87,43 +95,70 @@ def main() -> None:
         "--score-out", vocal_score,
     ], repo)
 
-    if not args.reuse_raw:
-        for stale in (raw_vocal, synced_vocal):
-            if stale.exists():
-                stale.unlink()
-        cmd = [
-            sys.executable, "-u", "soulx_vocals.py",
-            "--repo", repo,
-            "--root", root,
-            "--score", vocal_score,
-            "--out", raw_vocal,
-            "--svc-steps", str(max(8, min(40, args.steps))),
-        ]
-        if args.voice_reference is not None:
-            cmd += ["--voice-reference", args.voice_reference]
-        run(cmd, repo, show_failure_log=backend_log)
-    elif not raw_vocal.exists():
-        raise FileNotFoundError(f"--reuse-raw requested but raw SoulX vocal is missing: {raw_vocal}")
-    else:
-        print("♻️ Reusing existing SoulX raw vocal; no singer generation will run.")
-
-    shutil.copy2(raw_vocal, synced_vocal)
+    for stale in (pitch_quality, word_quality):
+        if stale.exists():
+            stale.unlink()
 
     try:
+        if not args.reuse_raw:
+            for stale in (raw_vocal, synced_vocal):
+                if stale.exists():
+                    stale.unlink()
+            cmd = [
+                sys.executable, "-u", "soulx_vocals.py",
+                "--repo", repo,
+                "--root", root,
+                "--score", vocal_score,
+                "--out", raw_vocal,
+                "--svc-steps", str(max(8, min(40, args.steps))),
+            ]
+            if args.voice_reference is not None:
+                cmd += ["--voice-reference", args.voice_reference]
+            run(cmd, repo, show_failure_log=backend_log)
+        elif not raw_vocal.exists():
+            raise FileNotFoundError(f"--reuse-raw requested but raw SoulX vocal is missing: {raw_vocal}")
+        else:
+            print("♻️ Reusing existing SoulX raw vocal; no singer generation will run.")
+
+        shutil.copy2(raw_vocal, synced_vocal)
         run([sys.executable, "-u", "vocal_quality_gate.py", "--vocal", synced_vocal, "--score", vocal_score, "--report", pitch_quality], repo)
-        run([sys.executable, "-u", "vocal_word_gate.py", "--vocal", synced_vocal, "--lyrics", lyrics_txt, "--report", word_quality], repo)
-    except Exception:
+        run([sys.executable, "-u", "vocal_word_gate.py", "--vocal", synced_vocal, "--lyrics", lyrics_txt, "--report", word_quality, "--model", "openai/whisper-base.en", "--min-recall", "0.30"], repo)
+
         if instrumental.exists():
             shutil.copy2(instrumental, master)
-        print("❌ Vocal failed pitch/word QA. The instrumental master has been restored.")
+        run([sys.executable, "-u", "mix_vocals.py", "--project", project, "--vocal", synced_vocal, "--plan", plan, "--out", master], repo)
+        payload = {
+            "format": "musicm8-final-status-v9",
+            "final_kind": "song_with_vocals",
+            "vocal_requested": True,
+            "vocal_ok": True,
+            "vocal_backend": read_json(project / "vocals" / "vocal_status.json"),
+            "pitch_qa": read_json(pitch_quality),
+            "word_qa": read_json(word_quality),
+            "master": str(master),
+            "instrumental": str(instrumental),
+        }
+        final_status.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        if instrumental.exists():
+            shutil.copy2(instrumental, master)
+        payload = {
+            "format": "musicm8-final-status-v9",
+            "final_kind": "instrumental_only_vocal_failed",
+            "vocal_requested": True,
+            "vocal_ok": False,
+            "vocal_error": str(exc),
+            "vocal_backend": read_json(project / "vocals" / "vocal_status.json"),
+            "pitch_qa": read_json(pitch_quality),
+            "word_qa": read_json(word_quality),
+            "master": str(master),
+            "instrumental": str(instrumental),
+        }
+        final_status.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        print("❌ Vocal generation/QA failed. master.wav is explicitly marked as an instrumental safety copy.")
         raise
 
-    if instrumental.exists():
-        shutil.copy2(instrumental, master)
-    run([sys.executable, "-u", "mix_vocals.py", "--project", project, "--vocal", synced_vocal, "--plan", plan, "--out", master], repo)
-
-    status_path = project / "vocals" / "vocal_status.json"
-    status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+    status = read_json(project / "vocals" / "vocal_status.json")
     print("\n✅ SCORE-CONTROLLED VOCAL COMPLETE")
     print("Method:", status.get("method", "SoulX-Singer"))
     print("Vocal melody:", vocal_midi)
