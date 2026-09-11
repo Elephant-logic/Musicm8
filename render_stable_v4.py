@@ -51,8 +51,8 @@ def stable_patches(style: str) -> dict[str, dict[str, Any]]:
     drums = {
         "gain": 0.76,
         "drive": 0.08,
-        "room": 0.06,
-        "width": 0.04,
+        "room": 0.04,
+        "width": 0.0,
         "kick": {"pitch_start": ks, "pitch_end": ke, "sweep": sw, "decay": kd, "click": kc},
         "snare": {"tone_hz": st, "decay": sd, "noise": sn, "brightness": sb},
         "hat": {"decay": hd, "open_decay": hod, "highpass": hp, "metallic": hm},
@@ -70,13 +70,13 @@ def stable_patches(style: str) -> dict[str, dict[str, Any]]:
         "sub": 0.82,
         "cutoff": float(p["bass_cut"]),
         "filter_env": 0.16,
-        "detune": 0.015,
+        "detune": 0.01,
         "attack": 0.004,
         "decay": 0.16,
         "sustain": 0.72,
         "release": 0.09,
         "drive": float(p["bass_drive"]),
-        "width": 0.015,
+        "width": 0.0,
         "gain": 0.50,
         "eq_low_db": 0.8,
         "eq_mid_db": -0.5,
@@ -91,14 +91,14 @@ def stable_patches(style: str) -> dict[str, dict[str, Any]]:
         "harmonics": [1.0, 0.30, 0.15, 0.08, 0.04, 0.02],
         "cutoff": float(p["chord_cut"]),
         "filter_env": 0.12,
-        "detune": 0.045,
-        "attack": 0.014,
-        "decay": 0.24,
+        "detune": 0.02,
+        "attack": 0.010,
+        "decay": 0.22,
         "sustain": 0.67,
-        "release": 0.22,
-        "drive": 0.035,
-        "reverb": 0.16,
-        "width": 0.34,
+        "release": 0.18,
+        "drive": 0.025,
+        "reverb": 0.10,
+        "width": 0.0,
         "gain": 0.27,
         "eq_low_db": -1.5,
         "eq_mid_db": 0.2,
@@ -111,15 +111,15 @@ def stable_patches(style: str) -> dict[str, dict[str, Any]]:
         "harmonics": [1.0, 0.42, 0.20, 0.09, 0.04],
         "cutoff": float(p["lead_cut"]),
         "filter_env": 0.18,
-        "detune": 0.025,
-        "attack": 0.006,
-        "decay": 0.14,
+        "detune": 0.01,
+        "attack": 0.004,
+        "decay": 0.12,
         "sustain": 0.58,
-        "release": 0.12,
-        "drive": 0.025,
-        "delay": 0.08,
-        "reverb": 0.12,
-        "width": 0.22,
+        "release": 0.10,
+        "drive": 0.02,
+        "delay": 0.04,
+        "reverb": 0.08,
+        "width": 0.0,
         "gain": 0.24,
         "eq_low_db": -2.0,
         "eq_mid_db": 0.3,
@@ -130,19 +130,18 @@ def stable_patches(style: str) -> dict[str, dict[str, Any]]:
 
 def safe_plan(plan: dict[str, Any]) -> dict[str, Any]:
     out = json.loads(json.dumps(plan))
-    # The producer may still choose arrangement/style, but it cannot push the stable
-    # source patches back into wide detune, large rooms or aggressive distortion.
+    # Producer chooses style/arrangement, but the foundation render cannot reintroduce
+    # delay-based widening, large detune, aggressive distortion or reference-audio layers.
     sd = out.setdefault("sound_design", {})
-    sd["drums"] = {"brightness": 0.55, "drive": 0.08, "room": 0.06}
-    sd["bass"] = {"sub": 0.80, "drive": 0.14, "filter_motion": 0.24, "width": 0.015}
-    sd["chords"] = {"brightness": 0.50, "detune": 0.045, "reverb": 0.16, "width": 0.34}
-    sd["melody"] = {"brightness": 0.56, "detune": 0.025, "delay": 0.08, "reverb": 0.12, "width": 0.22}
+    sd["drums"] = {"brightness": 0.55, "drive": 0.07, "room": 0.04}
+    sd["bass"] = {"sub": 0.80, "drive": 0.12, "filter_motion": 0.20, "width": 0.0}
+    sd["chords"] = {"brightness": 0.50, "detune": 0.02, "reverb": 0.10, "width": 0.0}
+    sd["melody"] = {"brightness": 0.56, "detune": 0.01, "delay": 0.04, "reverb": 0.08, "width": 0.0}
 
-    # Keep the mix controlled while the instrument foundation is being validated.
     mix = out.setdefault("production", {}).setdefault("mix", {})
-    mix["sidechain_depth"] = clamp(mix.get("sidechain_depth", 0.35), 0.12, 0.50, 0.35)
-    mix["sidechain_release"] = clamp(mix.get("sidechain_release", 0.16), 0.10, 0.26, 0.16)
-    mix["bus_ratio"] = clamp(mix.get("bus_ratio", 1.4), 1.15, 1.7, 1.4)
+    mix["sidechain_depth"] = clamp(mix.get("sidechain_depth", 0.35), 0.12, 0.46, 0.35)
+    mix["sidechain_release"] = clamp(mix.get("sidechain_release", 0.16), 0.10, 0.24, 0.16)
+    mix["bus_ratio"] = clamp(mix.get("bus_ratio", 1.35), 1.10, 1.55, 1.35)
     return out
 
 
@@ -178,13 +177,15 @@ def main() -> None:
         "pitched_reference_audio": False,
         "reference_drum_audio": False,
         "inverse_spectral_patch_search": False,
-        "note": "Foundation mode intentionally removes reference stem layers and free-running inverse sound matching. Every audible onset comes from the same MIDI clock and stable harmonic-safe synth/drum presets.",
+        "delay_based_stereo_width": False,
+        "note": "Foundation mode removes reference stem layers, free inverse sound matching and delay-based widening. Every audible onset comes from one MIDI clock and stable harmonic-safe source patches.",
     }
     (args.out / "stable_render_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print("✅ STABLE FOUNDATION RENDER V4")
     print("Style:", style)
     print("✅ No reference-audio layers")
     print("✅ No continuous FM / aggressive detune")
+    print("✅ No delay-based stereo widening")
     print("✅ All audible events follow the strict MIDI grid")
     print("Master base:", master)
 
