@@ -37,17 +37,11 @@ def simple_syllables(word: str) -> list[str]:
 
 
 def phonemes_for_text(text: str) -> str | None:
-    # If espeak-ng is present (installed by the Colab notebook), save a phoneme guide.
     exe = shutil.which("espeak-ng") or shutil.which("espeak")
     if not exe:
         return None
     try:
-        result = subprocess.run(
-            [exe, "-q", "--ipa=3", text],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
+        result = subprocess.run([exe, "-q", "--ipa=3", text], check=True, text=True, capture_output=True)
         value = result.stdout.strip()
         return value or None
     except Exception:
@@ -74,16 +68,14 @@ def lyric_units(lines: list[str]) -> list[dict[str, Any]]:
         for word_i, word in enumerate(words):
             syllables = simple_syllables(word)
             for syl_i, syl in enumerate(syllables):
-                units.append(
-                    {
-                        "text": syl,
-                        "word": word,
-                        "line_index": line_i,
-                        "word_index": word_i,
-                        "syllable_index": syl_i,
-                        "syllables_in_word": len(syllables),
-                    }
-                )
+                units.append({
+                    "text": syl,
+                    "word": word,
+                    "line_index": line_i,
+                    "word_index": word_i,
+                    "syllable_index": syl_i,
+                    "syllables_in_word": len(syllables),
+                })
     return units
 
 
@@ -92,23 +84,19 @@ def align_section(notes: list[pretty_midi.Note], lines: list[str]) -> list[dict[
         return []
     units = lyric_units(lines)
     if not units:
-        return [
-            {
-                "start": round(n.start, 5),
-                "end": round(n.end, 5),
-                "pitch": int(n.pitch),
-                "velocity": int(n.velocity),
-                "syllable": "_",
-                "word": None,
-                "phonemes": None,
-            }
-            for n in notes
-        ]
+        return [{
+            "start": round(n.start, 5),
+            "end": round(n.end, 5),
+            "duration": round(n.end - n.start, 5),
+            "pitch": int(n.pitch),
+            "velocity": int(n.velocity),
+            "syllable": "_",
+            "word": None,
+            "line_index": None,
+            "word_index": None,
+            "phonemes": None,
+        } for n in notes]
 
-    # Spread the available lyric syllables over the melody notes. If the melody has
-    # more notes than syllables, use melisma markers on the extra notes rather than
-    # inventing words. If there are more syllables, collapse adjacent syllables onto
-    # the nearest note and expose them as one written unit.
     aligned: list[dict[str, Any]] = []
     n_notes = len(notes)
     n_units = len(units)
@@ -118,29 +106,37 @@ def align_section(notes: list[pretty_midi.Note], lines: list[str]) -> list[dict[
         assignments[ni].append(unit)
 
     last_word: str | None = None
+    last_line: int | None = None
+    last_word_index: int | None = None
     for i, note in enumerate(notes):
         here = assignments[i]
         if here:
             syllable = "-".join(x["text"] for x in here)
             word = here[-1]["word"]
+            line_index = int(here[-1]["line_index"])
+            word_index = int(here[-1]["word_index"])
             last_word = word
+            last_line = line_index
+            last_word_index = word_index
             phonemes = phonemes_for_text(" ".join(dict.fromkeys(x["word"] for x in here)))
         else:
             syllable = "_"
             word = last_word
+            line_index = last_line
+            word_index = last_word_index
             phonemes = None
-        aligned.append(
-            {
-                "start": round(note.start, 5),
-                "end": round(note.end, 5),
-                "duration": round(note.end - note.start, 5),
-                "pitch": int(note.pitch),
-                "velocity": int(note.velocity),
-                "syllable": syllable,
-                "word": word,
-                "phonemes": phonemes,
-            }
-        )
+        aligned.append({
+            "start": round(note.start, 5),
+            "end": round(note.end, 5),
+            "duration": round(note.end - note.start, 5),
+            "pitch": int(note.pitch),
+            "velocity": int(note.velocity),
+            "syllable": syllable,
+            "word": word,
+            "line_index": line_index,
+            "word_index": word_index,
+            "phonemes": phonemes,
+        })
     return aligned
 
 
@@ -163,16 +159,10 @@ def main() -> None:
     for i, window in enumerate(windows):
         lines = lyric_sections[i].get("lines", []) if i < len(lyric_sections) else []
         notes = [n for n in all_notes if window["start"] <= n.start < window["end"]]
-        scored_sections.append(
-            {
-                **window,
-                "lines": lines,
-                "notes": align_section(notes, lines),
-            }
-        )
+        scored_sections.append({**window, "lines": lines, "notes": align_section(notes, lines)})
 
     payload = {
-        "format": "musicm8-vocal-score-v1",
+        "format": "musicm8-vocal-score-v2",
         "title": lyrics.get("title", "Musicm8 Song"),
         "language": lyrics.get("language", "en"),
         "bpm": float(plan.get("bpm", 120.0)),
@@ -180,7 +170,7 @@ def main() -> None:
         "mode": plan.get("mode", "minor"),
         "melody_midi": str(args.melody_midi),
         "sections": scored_sections,
-        "note": "Each melody note is aligned to a lyric syllable or '_' melisma marker. Phonemes use espeak IPA when available.",
+        "note": "Each melody note is aligned to a lyric syllable, lyric line and word index. These timings are the authority for vocal synchronization.",
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
