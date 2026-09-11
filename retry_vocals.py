@@ -8,9 +8,35 @@ import sys
 from pathlib import Path
 
 
-def run(cmd: list[str], cwd: Path) -> None:
-    print("\n$", " ".join(map(str, cmd)), flush=True)
-    subprocess.run([str(x) for x in cmd], cwd=str(cwd), check=True)
+def run(cmd: list[str], cwd: Path, *, show_failure_log: Path | None = None) -> None:
+    cmd = [str(x) for x in cmd]
+    print("\n$", " ".join(cmd), flush=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    output = proc.stdout or ""
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    if proc.returncode != 0:
+        print("\n" + "=" * 70)
+        print("❌ COMMAND FAILED — REAL BACKEND DIAGNOSTICS")
+        print("=" * 70)
+        if show_failure_log and show_failure_log.exists():
+            lines = show_failure_log.read_text(encoding="utf-8", errors="ignore").splitlines()
+            print(f"Backend log: {show_failure_log}")
+            print("\n--- LAST 180 LOG LINES ---")
+            print("\n".join(lines[-180:]))
+            print("--- END LOG ---")
+        else:
+            print("No backend log was found.")
+        raise RuntimeError(
+            f"Command failed with exit code {proc.returncode}. "
+            "The real backend error is printed above; do not rely on the outer CalledProcessError."
+        )
 
 
 def main() -> None:
@@ -31,6 +57,7 @@ def main() -> None:
     raw_vocal = project / "vocals" / "neural_lead_raw.wav"
     instrumental = project / "master_instrumental.wav"
     master = project / "master.wav"
+    backend_log = project / "vocals" / "vocal_backend.log"
 
     if not project.exists():
         raise FileNotFoundError(f"Missing Musicm8 project: {project}")
@@ -39,7 +66,6 @@ def main() -> None:
     if not plan.exists():
         raise FileNotFoundError(f"Missing plan: {plan}")
 
-    # Prefer the preserved clean instrumental if a previous vocal mix existed.
     backing = instrumental if instrumental.exists() else master
     if not backing.exists():
         raise FileNotFoundError(f"Missing instrumental/master: {backing}")
@@ -49,6 +75,7 @@ def main() -> None:
     print("Backing:", backing)
     print("Lyrics :", lyrics)
     print("Plan   :", plan)
+    print("Log    :", backend_log)
 
     run([
         sys.executable, "-u", "neural_vocals.py",
@@ -62,9 +89,8 @@ def main() -> None:
         "--language", args.language,
         "--seed", str(args.seed),
         "--steps", str(args.steps),
-    ], repo)
+    ], repo, show_failure_log=backend_log)
 
-    # Restore the clean instrumental as master before adding the newly-created vocal.
     if backing != master:
         shutil.copy2(backing, master)
 
