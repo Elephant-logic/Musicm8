@@ -34,7 +34,6 @@ def choose_soundfont(explicit: Path | None = None) -> Path:
     for p in candidates:
         if p.exists() and p.stat().st_size > 1_000_000:
             return p
-    # Last resort: search standard system sound directories only.
     for base in (Path("/usr/share/sounds"), Path("/usr/share/mscore3/sounds")):
         if base.exists():
             found = sorted(list(base.rglob("*.sf3")) + list(base.rglob("*.sf2")), key=lambda p: p.stat().st_size, reverse=True)
@@ -80,6 +79,93 @@ def render_midi(fluidsynth: str, soundfont: Path, midi: Path, wav: Path) -> None
         raise RuntimeError(f"FluidSynth failed for {midi}\n{tail}")
 
 
+def _grid_start(t: float, bpm: float, swing: float) -> tuple[float, int]:
+    step = 60.0 / max(1.0, bpm) / 4.0  # sixteenth-note grid
+    idx = max(0, int(round(float(t) / step)))
+    start = idx * step + (step * swing if idx % 2 else 0.0)
+    return float(start), idx
+
+
+def tighten_role_midi(path: Path, bpm: float, swing: float, role: str) -> dict[str, Any]:
+    """Rewrite one role stem onto the exact same musical clock used by every role.
+
+    MIDI-LLM remains the composer: pitches, instrument choices and rhythmic grid
+    positions are retained.  This pass only removes floating timing drift,
+    duplicate same-grid hits and invalid percussion notes before audio rendering.
+    The rewritten file is also what the vocal-score stage subsequently reads.
+    """
+    pm = pretty_midi.PrettyMIDI(str(path))
+    out = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+    step = 60.0 / max(1.0, bpm) / 4.0
+    half = step * 0.5
+    corrected = 0
+    dropped = 0
+    duplicates = 0
+    max_shift_ms = 0.0
+
+    for src in pm.instruments:
+        dst = pretty_midi.Instrument(program=src.program, is_drum=src.is_drum, name=src.name)
+        seen: set[tuple[int, int]] = set()
+        for n in sorted(src.notes, key=lambda x: (x.start, x.pitch, x.end)):
+            start, idx = _grid_start(float(n.start), bpm, swing)
+            shift_ms = abs(start - float(n.start)) * 1000.0
+            max_shift_ms = max(max_shift_ms, shift_ms)
+            if shift_ms > 0.05:
+                corrected += 1
+
+            pitch = int(n.pitch)
+            if role == "drums" or src.is_drum:
+                # GM percussion lives here. Stray notes outside the kit range can
+                # become bizarre pitched/percussive noises that sound like rogue beats.
+                if not 35 <= pitch <= 81:
+                    dropped += 1
+                    continue
+                end = start + min(0.12, step * 0.85)
+            else:
+                dur = max(half, float(n.end) - float(n.start))
+                dur = max(half, round(dur / half) * half)
+                end = start + dur
+
+            key = (pitch, idx)
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            dst.notes.append(pretty_midi.Note(
+                velocity=int(np.clip(n.velocity, 1, 127)),
+                pitch=pitch,
+                start=start,
+                end=max(start + 0.015, end),
+            ))
+        if dst.notes:
+            out.instruments.append(dst)
+
+    if not out.instruments:
+        raise RuntimeError(f"Timing guard removed every event from {path}")
+
+    # Avoid same-pitch note overlap after exact quantisation.
+    if role != "drums":
+        for inst in out.instruments:
+            by_pitch: dict[int, list[pretty_midi.Note]] = {}
+            for n in inst.notes:
+                by_pitch.setdefault(int(n.pitch), []).append(n)
+            for notes in by_pitch.values():
+                notes.sort(key=lambda x: x.start)
+                for a, b in zip(notes, notes[1:]):
+                    if a.end > b.start:
+                        a.end = max(a.start + 0.015, b.start - 0.002)
+
+    out.write(str(path))
+    return {
+        "events": sum(len(i.notes) for i in out.instruments),
+        "corrected": corrected,
+        "duplicates_removed": duplicates,
+        "invalid_drum_notes_removed": dropped,
+        "max_start_correction_ms": round(max_shift_ms, 4),
+        "grid": "shared 1/16 + shared swing",
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Render Musicm8's learned multitrack MIDI using real sampled SoundFont instruments instead of the primitive oscillator engine.")
     p.add_argument("--project", type=Path, required=True)
@@ -96,6 +182,24 @@ def main() -> None:
     if not stems_dir.exists():
         raise FileNotFoundError(stems_dir)
 
+    bpm = float(plan.get("bpm", 120.0))
+    swing = float(np.clip(float(plan.get("groove", {}).get("swing", 0.0)), 0.0, 0.20))
+    timing_report: dict[str, Any] = {
+        "format": "musicm8-v10-render-clock-v1",
+        "bpm": bpm,
+        "swing": swing,
+        "roles": {},
+        "note": "MIDI-LLM composes the events. Immediately before audio rendering all roles are rewritten onto one shared sixteenth-note/swing clock, removing only timing drift, exact duplicates and invalid GM percussion notes.",
+    }
+    print("🥁 V10 RENDER CLOCK — hard-locking every stem to one shared groove")
+    for role in ROLES:
+        midi = stems_dir / f"{role}.mid"
+        if midi.exists():
+            timing_report["roles"][role] = tighten_role_midi(midi, bpm, swing, role)
+            info = timing_report["roles"][role]
+            print(f"   {role}: {info['events']} events | max correction {info['max_start_correction_ms']} ms")
+    (project / "render_timing_report.json").write_text(json.dumps(timing_report, indent=2), encoding="utf-8")
+
     fluidsynth = shutil.which("fluidsynth")
     if not fluidsynth:
         raise RuntimeError("fluidsynth executable not found. The current Colab notebook installs it automatically.")
@@ -103,7 +207,6 @@ def main() -> None:
     print("🎹 Sample instrument bank:", soundfont)
 
     pm = pretty_midi.PrettyMIDI(str(arrangement))
-    bpm = float(plan.get("bpm", 120.0))
     bars = int(plan.get("bars", 32))
     planned_end = bars * 4.0 * 60.0 / max(1.0, bpm)
     music_end = max(planned_end, float(pm.get_end_time()))
@@ -113,12 +216,13 @@ def main() -> None:
     shutil.rmtree(audio_dir, ignore_errors=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
-        "format": "musicm8-soundfont-render-v1",
+        "format": "musicm8-soundfont-render-v2",
         "source": "sample-based GM SoundFont",
         "soundfont": str(soundfont),
         "sample_rate": SR,
         "roles": {},
-        "timing": "MIDI event timestamps are rendered directly; no sample slicing/time-stretching/reference-loop placement is used.",
+        "timing": "All rendered role MIDIs are hard-locked to one shared 1/16/swing clock immediately before FluidSynth. No sample slicing, time-stretching or reference-loop placement is used.",
+        "timing_report": str(project / "render_timing_report.json"),
     }
     mix = np.zeros((2, total_n), dtype=np.float32)
 
@@ -136,7 +240,6 @@ def main() -> None:
             if sr != SR:
                 raise ValueError(f"FluidSynth returned {sr} Hz, expected {SR}")
             x = fit(x, total_n)
-            # Only catch pathological SoundFont peaks. Level/balance is handled by the mix stage.
             peak = float(np.max(np.abs(x))) + 1e-9
             if peak > 0.98:
                 x *= 0.98 / peak
@@ -161,6 +264,7 @@ def main() -> None:
     (project / "soundfont_render_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("✅ SAMPLE-BASED MULTITRACK RENDER")
+    print("✅ All stems rendered from the same hard-locked MIDI clock")
     print("No reference stem chunks. No pitch-shifted old-song audio. No hand-built oscillator instruments in the audible source.")
     print("Audio stems:", audio_dir)
 
