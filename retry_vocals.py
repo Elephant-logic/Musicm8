@@ -37,7 +37,7 @@ def read_json(path: Path) -> dict:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Retry only Musicm8 v9 score-controlled SoulX vocals on the existing instrumental.")
+    p = argparse.ArgumentParser(description="Retry only Musicm8 v10 harmony-locked SoulX vocals on the existing AI instrumental.")
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent)
     p.add_argument("--style", default="expressive contemporary lead vocal")
@@ -64,6 +64,8 @@ def main() -> None:
     master = project / "master.wav"
     backend_log = project / "vocals" / "vocal_backend.log"
     final_status = project / "final_status.json"
+    harmony_midi = project / "midi_stems" / "chords.mid"
+    melody_midi = project / "midi_stems" / "melody.mid"
 
     for path in (project, lyrics_txt, lyrics_json, plan):
         if not path.exists():
@@ -78,22 +80,33 @@ def main() -> None:
     os.environ["PYTHONPATH"] = str(repo) + (os.pathsep + old_pythonpath if old_pythonpath else "")
     raw_vocal.parent.mkdir(parents=True, exist_ok=True)
 
-    print("🎤 MUSICM8 V9 VOCAL-ONLY RETRY")
+    print("🎤 MUSICM8 V10 VOCAL-ONLY RETRY")
     print("Backing:", backing)
     print("Lyrics :", lyrics_txt)
     print("Plan   :", plan)
+    print("Harmony:", harmony_midi if harmony_midi.exists() else "song-key fallback")
+    print("Lead rhythm:", melody_midi if melody_midi.exists() else "shared beat grid")
     print("Voice reference:", args.voice_reference or "default SoulX prompt singer")
     print("\n================ 📝 LYRICS USED ================\n")
     print(lyrics_txt.read_text(encoding="utf-8", errors="ignore"))
     print("=================================================\n")
 
-    run([
-        sys.executable, "-u", "vocal_lead_score.py",
+    score_cmd = [
+        sys.executable, "-u", "vocal_lead_score_ai.py",
         "--plan", plan,
         "--lyrics", lyrics_json,
         "--midi-out", vocal_midi,
         "--score-out", vocal_score,
-    ], repo)
+    ]
+    if harmony_midi.exists():
+        score_cmd += ["--harmony-midi", harmony_midi]
+    if melody_midi.exists():
+        score_cmd += ["--melody-midi", melody_midi]
+    run(score_cmd, repo)
+
+    score_info = read_json(vocal_score)
+    print("Harmony fit:", score_info.get("harmony_fit"))
+    print("Rhythm source:", score_info.get("rhythm_source"))
 
     for stale in (pitch_quality, word_quality):
         if stale.exists():
@@ -122,19 +135,20 @@ def main() -> None:
 
         shutil.copy2(raw_vocal, synced_vocal)
         run([sys.executable, "-u", "vocal_quality_gate.py", "--vocal", synced_vocal, "--score", vocal_score, "--report", pitch_quality], repo)
-        run([sys.executable, "-u", "vocal_word_gate.py", "--vocal", synced_vocal, "--lyrics", lyrics_txt, "--report", word_quality, "--model", "openai/whisper-base.en", "--min-recall", "0.30"], repo)
+        run([sys.executable, "-u", "vocal_word_gate.py", "--vocal", synced_vocal, "--lyrics", lyrics_txt, "--report", word_quality, "--model", "openai/whisper-base.en", "--min-recall", "0.55"], repo)
 
         if instrumental.exists():
             shutil.copy2(instrumental, master)
         run([sys.executable, "-u", "mix_vocals.py", "--project", project, "--vocal", synced_vocal, "--plan", plan, "--out", master], repo)
         payload = {
-            "format": "musicm8-final-status-v9",
+            "format": "musicm8-final-status-v10",
             "final_kind": "song_with_vocals",
             "vocal_requested": True,
             "vocal_ok": True,
             "vocal_backend": read_json(project / "vocals" / "vocal_status.json"),
             "pitch_qa": read_json(pitch_quality),
             "word_qa": read_json(word_quality),
+            "vocal_score": score_info,
             "master": str(master),
             "instrumental": str(instrumental),
         }
@@ -143,7 +157,7 @@ def main() -> None:
         if instrumental.exists():
             shutil.copy2(instrumental, master)
         payload = {
-            "format": "musicm8-final-status-v9",
+            "format": "musicm8-final-status-v10",
             "final_kind": "instrumental_only_vocal_failed",
             "vocal_requested": True,
             "vocal_ok": False,
@@ -151,6 +165,7 @@ def main() -> None:
             "vocal_backend": read_json(project / "vocals" / "vocal_status.json"),
             "pitch_qa": read_json(pitch_quality),
             "word_qa": read_json(word_quality),
+            "vocal_score": score_info,
             "master": str(master),
             "instrumental": str(instrumental),
         }
@@ -159,7 +174,7 @@ def main() -> None:
         raise
 
     status = read_json(project / "vocals" / "vocal_status.json")
-    print("\n✅ SCORE-CONTROLLED VOCAL COMPLETE")
+    print("\n✅ HARMONY-LOCKED VOCAL COMPLETE")
     print("Method:", status.get("method", "SoulX-Singer"))
     print("Vocal melody:", vocal_midi)
     print("Raw/score vocal:", raw_vocal)
