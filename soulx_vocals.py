@@ -71,9 +71,6 @@ def ensure_environment(uv: str, venv: Path, env: dict[str, str], log: Path) -> P
     shutil.rmtree(venv, ignore_errors=True)
     run([uv, "venv", "--python", "3.10", venv], env=env, log=log)
 
-    # PyTorch CUDA wheels live on the PyTorch index, while normal dependencies live
-    # on PyPI. Supplying both avoids the common isolated-env failure where uv looks
-    # only at download.pytorch.org for packages such as filelock/typing-extensions.
     torch_index = "https://download.pytorch.org/whl/cu121"
     run([
         uv, "pip", "install", "--python", py,
@@ -160,10 +157,10 @@ def main() -> None:
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     status = {
-        "format": "musicm8-vocal-backend-status-v8",
+        "format": "musicm8-vocal-backend-status-v9",
         "backend": "SoulX-Singer",
         "source_revision": SOULX_COMMIT,
-        "mode": "score-conditioned",
+        "mode": "score-conditioned-clip-safe-chunks",
         "success": False,
         "voice_clone": bool(args.voice_reference),
         "voice_reference": str(args.voice_reference) if args.voice_reference else None,
@@ -191,37 +188,33 @@ def main() -> None:
             if not required.exists():
                 raise FileNotFoundError(required)
 
-        save_dir = args.out.parent / "soulx_score_output"
-        shutil.rmtree(save_dir, ignore_errors=True)
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        print("\n🎤 SoulX-Singer: exact words + phonemes + MIDI score -> singing")
+        guide_copy = args.out.parent / "soulx_score_guide.wav"
+        if guide_copy.exists():
+            guide_copy.unlink()
+        print("\n🎤 SoulX-Singer: phrase chunks with exact words + phonemes + MIDI score")
+        print("   Each phrase is generated separately, kept inside its own time window and overlap-added with short edge fades.")
         run([
-            py, "-m", "cli.inference",
-            "--device", "cuda",
-            "--model_path", model,
+            py, args.repo / "soulx_chunked_inference.py",
+            "--model-path", model,
             "--config", config,
-            "--prompt_wav_path", prompt_wav,
-            "--prompt_metadata_path", prompt_meta,
-            "--target_metadata_path", metadata,
-            "--phoneset_path", phoneset,
-            "--save_dir", save_dir,
-            "--control", "score",
+            "--prompt-wav", prompt_wav,
+            "--prompt-metadata", prompt_meta,
+            "--target-metadata", metadata,
+            "--phoneset", phoneset,
+            "--out", guide_copy,
+            "--device", "cuda",
             "--fp16",
         ], cwd=args.soulx_root, env=env, log=log)
 
-        guide = save_dir / "generated.wav"
-        if not guide.exists() or guide.stat().st_size < 4096:
-            raise FileNotFoundError(f"SoulX score inference did not create a usable {guide}")
-        guide_copy = args.out.parent / "soulx_score_guide.wav"
-        shutil.copy2(guide, guide_copy)
+        if not guide_copy.exists() or guide_copy.stat().st_size < 4096:
+            raise FileNotFoundError(f"SoulX chunked inference did not create a usable {guide_copy}")
 
         final_source = guide_copy
-        method = "soulx-score"
+        method = "soulx-score-chunked"
         if args.voice_reference is not None:
             svc_model = ensure_model(py, models_dir, "model-svc.pt", env, log)
             cloned = args.out.parent / "soulx_voice_cloned.wav"
-            print("\n🧑‍🎤 SoulX-Singer-SVC: converting guide to authorized reference timbre")
+            print("\n🧑‍🎤 SoulX-Singer-SVC: converting clip-safe guide to authorized reference timbre")
             run([
                 py, args.repo / "soulx_svc_runner.py",
                 "--soulx-root", args.soulx_root,
@@ -234,7 +227,7 @@ def main() -> None:
             if not cloned.exists() or cloned.stat().st_size < 4096:
                 raise FileNotFoundError(cloned)
             final_source = cloned
-            method = "soulx-score+svc"
+            method = "soulx-score-chunked+svc"
 
         shutil.copy2(final_source, args.out)
         status.update({
@@ -242,11 +235,12 @@ def main() -> None:
             "method": method,
             "model": str(model),
             "target_metadata": str(metadata),
+            "chunk_report": str(guide_copy.with_suffix('.chunks.json')),
             "guide": str(guide_copy),
             "output": str(args.out),
         })
         status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
-        print("\n✅ SCORE-CONTROLLED SINGING CREATED")
+        print("\n✅ SCORE-CONTROLLED CHUNKED SINGING CREATED")
         print("Method:", method)
         print("Vocal:", args.out)
     except Exception as exc:
