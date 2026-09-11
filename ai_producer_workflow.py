@@ -64,6 +64,7 @@ def main() -> None:
     arrangement = project / "arrangement.mid"
     matched = project / "matched_patches.json"
     raw_vocal = project / "vocals" / "neural_lead_raw.wav"
+    timed_vocal = project / "vocals" / "neural_lead_timed.wav"
     synced_vocal = project / "vocals" / "neural_lead_synced.wav"
     vocal_quality = project / "vocals" / "vocal_quality.json"
 
@@ -78,7 +79,7 @@ def main() -> None:
     print("GPU:", torch.cuda.get_device_name(0))
     print("Idea:", args.idea)
     print("Song seed:", args.seed)
-    print("Musicm8 v7: strict tuning + safe synthesis + genre production + quality-gated vocals")
+    print("Musicm8 v7: strict tuning + safe synthesis + exact phrase timing + vocal pitch QA")
 
     print("\n=== 1/13 ANALYSE REFERENCE SONGS ===")
     cmd = [sys.executable, "-u", "daw_extract.py", "--audio-dir", audio, "--out", dataset, "--device", "cuda"]
@@ -156,20 +157,26 @@ def main() -> None:
             print("⚠️ Melody MIDI missing; vocal score unavailable.")
 
         print("\n=== 11/13 NEURAL SINGING — DICTION MODE ===")
-        if raw_vocal.exists():
-            raw_vocal.unlink()
+        for old in (raw_vocal, timed_vocal, synced_vocal):
+            if old.exists():
+                old.unlink()
         cmd = [sys.executable, "-u", "neural_vocals.py", "--repo", repo, "--root", root, "--backing", instrumental, "--lyrics", lyrics_txt, "--plan", plan, "--out", raw_vocal, "--style", args.vocal_style, "--language", args.vocal_language, "--seed", str(args.seed), "--steps", str(args.vocal_steps)]
         vocal_ok, vocal_error = run_optional(cmd, repo, "Neural vocal generation")
 
-        print("\n=== 12/13 SCORE-LOCK + VOCAL PITCH QA ===")
+        print("\n=== 12/13 EXACT PHRASE TIMING + SCORE LOCK + PITCH QA ===")
         if vocal_ok and raw_vocal.exists() and vocal_score.exists():
-            vocal_ok, vocal_error = run_optional([sys.executable, "-u", "vocal_sync.py", "--vocal", raw_vocal, "--score", vocal_score, "--out", synced_vocal], repo, "Vocal score sync")
-            if vocal_ok and synced_vocal.exists():
-                vocal_ok, vocal_error = run_optional([sys.executable, "-u", "vocal_quality_gate.py", "--vocal", synced_vocal, "--score", vocal_score, "--report", vocal_quality], repo, "Vocal pitch quality gate")
-                if not vocal_ok:
-                    print("❌ Vocal rejected: it is still too far from the written melody. The clean instrumental will be kept instead of mixing a bad singer.")
+            vocal_ok, vocal_error = run_optional([
+                sys.executable, "-u", "vocal_post_v2.py",
+                "--repo", repo,
+                "--raw", raw_vocal,
+                "--score", vocal_score,
+                "--synced", synced_vocal,
+                "--quality-report", vocal_quality,
+            ], repo, "Vocal timing/pitch QA")
+            if not vocal_ok:
+                print("❌ Vocal rejected: timing or pitch still fails the written score. The clean instrumental will be kept instead of mixing a bad singer.")
         else:
-            print("⏭️ No raw vocal/score to sync.")
+            print("⏭️ No raw vocal/score to post-process.")
 
         print("\n=== 13/13 GENRE VOCAL PROCESSING + FINAL MIX ===")
         if vocal_ok and synced_vocal.exists():
@@ -190,7 +197,7 @@ def main() -> None:
         "producer": "ai+genre-production-director",
         "composer": "phrase-aware-genre-v3+tuning-guard-v1",
         "mix_engine": "musicm8-mix-polish-v3+reference-master",
-        "vocal_engine": "ACE-Step-1.5 clarity mode + score lock + pitch QA" if not args.no_vocals else None,
+        "vocal_engine": "ACE-Step-1.5 clarity + phrase timing rebuild + score lock + pitch QA" if not args.no_vocals else None,
         "idea": args.idea,
         "seed": args.seed,
         "plan": str(plan),
@@ -200,6 +207,7 @@ def main() -> None:
         "user_lyrics_file": str(args.lyrics_file) if args.lyrics_file else None,
         "vocal_score": str(vocal_score) if vocal_score.exists() else None,
         "raw_neural_vocal": str(raw_vocal) if raw_vocal.exists() else None,
+        "timed_neural_vocal": str(timed_vocal) if timed_vocal.exists() else None,
         "synced_neural_vocal": str(synced_vocal) if synced_vocal.exists() else None,
         "vocal_quality_report": str(vocal_quality) if vocal_quality.exists() else None,
         "vocal_status": "ok" if vocal_ok else ("disabled" if args.no_vocals else "rejected_or_failed"),
