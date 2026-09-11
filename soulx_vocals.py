@@ -157,10 +157,10 @@ def main() -> None:
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     status = {
-        "format": "musicm8-vocal-backend-status-v9",
+        "format": "musicm8-vocal-backend-status-v10",
         "backend": "SoulX-Singer",
         "source_revision": SOULX_COMMIT,
-        "mode": "score-conditioned-clip-safe-chunks",
+        "mode": "score-conditioned-natural-phrase-chunks",
         "success": False,
         "voice_clone": bool(args.voice_reference),
         "voice_reference": str(args.voice_reference) if args.voice_reference else None,
@@ -174,7 +174,19 @@ def main() -> None:
     try:
         uv = ensure_uv()
         ensure_source(args.soulx_root, log)
+
+        # The inference script lives in Musicm8, so Python otherwise uses
+        # /content/Musicm8 as sys.path[0] and cannot see the sibling SoulX source
+        # checkout. Put both source roots on PYTHONPATH for every isolated process.
+        inherited = [x for x in env.get("PYTHONPATH", "").split(os.pathsep) if x]
+        roots = [str(args.soulx_root.resolve()), str(args.repo.resolve())]
+        env["PYTHONPATH"] = os.pathsep.join(roots + [x for x in inherited if x not in roots])
+
         py = ensure_environment(uv, venv, env, log)
+        run([
+            py, "-c",
+            "import soulxsinger, pathlib; print('SoulX package import OK:', pathlib.Path(soulxsinger.__file__).resolve())",
+        ], cwd=args.soulx_root, env=env, log=log)
         model = ensure_model(py, models_dir, "model.pt", env, log)
 
         metadata = args.out.parent / "soulx_target_metadata.json"
@@ -191,8 +203,8 @@ def main() -> None:
         guide_copy = args.out.parent / "soulx_score_guide.wav"
         if guide_copy.exists():
             guide_copy.unlink()
-        print("\n🎤 SoulX-Singer: phrase chunks with exact words + phonemes + MIDI score")
-        print("   Each phrase is generated separately, kept inside its own time window and overlap-added with short edge fades.")
+        print("\n🎤 SoulX-Singer: natural phrase chunks with exact words + phonemes + harmony-locked MIDI score")
+        print("   Each short phrase is generated separately, kept inside its exact song window and overlap-added with soft edges.")
         run([
             py, args.repo / "soulx_chunked_inference.py",
             "--model-path", model,
@@ -210,11 +222,11 @@ def main() -> None:
             raise FileNotFoundError(f"SoulX chunked inference did not create a usable {guide_copy}")
 
         final_source = guide_copy
-        method = "soulx-score-chunked"
+        method = "soulx-score-natural-chunked"
         if args.voice_reference is not None:
             svc_model = ensure_model(py, models_dir, "model-svc.pt", env, log)
             cloned = args.out.parent / "soulx_voice_cloned.wav"
-            print("\n🧑‍🎤 SoulX-Singer-SVC: converting clip-safe guide to authorized reference timbre")
+            print("\n🧑‍🎤 SoulX-Singer-SVC: converting harmony-locked guide to authorized reference timbre")
             run([
                 py, args.repo / "soulx_svc_runner.py",
                 "--soulx-root", args.soulx_root,
@@ -227,7 +239,7 @@ def main() -> None:
             if not cloned.exists() or cloned.stat().st_size < 4096:
                 raise FileNotFoundError(cloned)
             final_source = cloned
-            method = "soulx-score-chunked+svc"
+            method = "soulx-score-natural-chunked+svc"
 
         shutil.copy2(final_source, args.out)
         status.update({
