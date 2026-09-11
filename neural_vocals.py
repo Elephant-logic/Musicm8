@@ -159,13 +159,14 @@ def main() -> None:
     hf_cache = Path("/content/musicm8_hf_cache")
     uv_cache = Path("/content/musicm8_uv_cache")
     uv_python = Path("/content/musicm8_uv_python")
+    mpl_config = Path("/content/musicm8_mpl_config")
     log = args.out.parent / "vocal_backend.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("Musicm8 vocal backend log\n", encoding="utf-8")
 
     uv = ensure_uv()
     ensure_ace_source(args.ace_root, log)
-    for path in (models_dir, hf_cache, uv_cache, uv_python):
+    for path in (models_dir, hf_cache, uv_cache, uv_python, mpl_config):
         path.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
@@ -176,10 +177,17 @@ def main() -> None:
     env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # Colab exports an inline Matplotlib backend that only exists in the notebook
+    # kernel. ACE-Step runs in a separate uv Python environment, where that backend
+    # is invalid and crashes torchmetrics/lightning during import. Force a standard
+    # headless backend for every ACE-Step subprocess.
+    env["MPLBACKEND"] = "Agg"
+    env["MPLCONFIGDIR"] = str(mpl_config)
 
     print("uv cache (local):", uv_cache)
     print("uv Python (local):", uv_python)
     print("HF cache (local):", hf_cache)
+    print("Matplotlib backend:", env["MPLBACKEND"])
     print("ACE-Step models (Drive):", models_dir)
 
     ensure_environment(uv, args.ace_root, env, log)
@@ -187,7 +195,7 @@ def main() -> None:
 
     runner = args.repo / "ace_step_vocal_runner.py"
     status = {
-        "format": "musicm8-vocal-backend-status-v4",
+        "format": "musicm8-vocal-backend-status-v5",
         "backend": "ACE-Step-1.5",
         "primary": "base-lego-vocals",
         "fallbacks": ["base-cover+demucs", "turbo-text2music+demucs"],
@@ -198,6 +206,7 @@ def main() -> None:
         "uv_cache": str(uv_cache),
         "uv_python": str(uv_python),
         "hf_cache": str(hf_cache),
+        "matplotlib_backend": env["MPLBACKEND"],
     }
 
     try:
