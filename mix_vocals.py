@@ -4,6 +4,8 @@ import argparse
 import json
 import math
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import librosa
@@ -53,7 +55,6 @@ def simple_deesser(stereo: np.ndarray, amount: float = 0.45) -> np.ndarray:
         return stereo
     high = filt(stereo, 5200.0, "high")
     body = stereo - high
-    # Compress only the sibilant/high-frequency band, leaving presence intact.
     controlled = block_compressor(high, threshold_db=-27.0, ratio=3.5 + 3.0 * amount, makeup_db=0.0)
     return (body + high * (1.0 - 0.22 * amount) + controlled * (0.22 * amount)).astype(np.float32)
 
@@ -75,7 +76,6 @@ def vocal_activity(mono: np.ndarray) -> np.ndarray:
         if part.size:
             levels[i] = math.sqrt(float(np.mean(part * part)) + 1e-12)
     levels /= float(levels.max()) + 1e-8
-    # Smooth the activity envelope so backing ducking breathes musically.
     kernel = np.ones(11, dtype=np.float32) / 11.0
     levels = np.convolve(levels, kernel, mode="same")
     return np.interp(np.arange(len(mono)), np.linspace(0, len(mono) - 1, len(levels)), levels).astype(np.float32)
@@ -93,7 +93,6 @@ def process_vocals(raw: np.ndarray, sr: int, bpm: float) -> dict[str, np.ndarray
     lead = saturate(lead, 0.035)
     lead = set_rms(lead, -20.0, 8.0)
 
-    # Realistic production doubles: different micro-delays and slightly different tone.
     left_mono = delay_mono(mono, 0.018)
     right_mono = delay_mono(mono, 0.027)
     left_mono = filt(left_mono, 10500.0, "low")
@@ -102,7 +101,6 @@ def process_vocals(raw: np.ndarray, sr: int, bpm: float) -> dict[str, np.ndarray
     right = set_rms(np.vstack([np.zeros_like(right_mono), right_mono]), -31.0, 5.0)
 
     vocal_mix = lead + left + right
-    # Short room plus tempo-aware longer tail. Keep the dry lyric intelligibility forward.
     room = reverb(vocal_mix, 0.16)
     beat_delay = max(1, int((60.0 / max(1.0, bpm)) * 0.75 * SR))
     echo = np.zeros_like(vocal_mix)
@@ -117,6 +115,21 @@ def fit_length(x: np.ndarray, n: int) -> np.ndarray:
     if x.shape[-1] >= n:
         return x[:, :n]
     return np.pad(x, ((0, 0), (0, n - x.shape[-1]))).astype(np.float32)
+
+
+def score_lock_if_available(project: Path, vocal: Path) -> Path:
+    score = project / "vocal_score.json"
+    if not score.exists() or vocal.name == "neural_lead_synced.wav":
+        return vocal
+    synced = project / "vocals" / "neural_lead_synced.wav"
+    print("🎯 Locking neural vocal to Musicm8 vocal score before mixing...")
+    subprocess.run([
+        sys.executable, "-u", str(Path(__file__).resolve().parent / "vocal_sync.py"),
+        "--vocal", str(vocal),
+        "--score", str(score),
+        "--out", str(synced),
+    ], check=True)
+    return synced
 
 
 def main() -> None:
@@ -135,7 +148,8 @@ def main() -> None:
     if not args.vocal.exists():
         raise FileNotFoundError(args.vocal)
 
-    # Preserve the instrumental before vocals are added.
+    vocal_path = score_lock_if_available(project, args.vocal)
+
     instrumental = project / "master_instrumental.wav"
     shutil.copy2(backing_path, instrumental)
     backing_raw, backing_sr = read_audio(backing_path)
@@ -146,7 +160,7 @@ def main() -> None:
     else:
         backing = ensure_stereo(backing_raw)
 
-    raw_vocal, vocal_sr = read_audio(args.vocal)
+    raw_vocal, vocal_sr = read_audio(vocal_path)
     parts = process_vocals(raw_vocal, vocal_sr, float(plan.get("bpm", 120.0)))
     n = backing.shape[-1]
     parts = {k: fit_length(v, n) for k, v in parts.items()}
@@ -156,7 +170,6 @@ def main() -> None:
         sf.write(vocals_dir / f"{name}.wav", audio.T, SR, subtype="PCM_24")
 
     activity = vocal_activity(parts["lead"].mean(axis=0))
-    # Duck the backing by up to about 1.5 dB while the lead is active.
     duck = 1.0 - 0.16 * np.clip(activity, 0.0, 1.0)
     combined = backing * duck[None] + parts["vocal_mix"]
     combined = block_compressor(combined, threshold_db=-8.5, ratio=1.45, makeup_db=0.0)
@@ -169,8 +182,9 @@ def main() -> None:
     out = args.out or (project / "master.wav")
     sf.write(out, combined.T, SR, subtype="PCM_24")
     report = {
-        "format": "musicm8-vocal-mix-v1",
+        "format": "musicm8-vocal-mix-v2",
         "raw_neural_vocal": str(args.vocal),
+        "score_locked_vocal": str(vocal_path),
         "instrumental_master": str(instrumental),
         "lead": str(vocals_dir / "lead.wav"),
         "double_L": str(vocals_dir / "double_L.wav"),
@@ -178,9 +192,10 @@ def main() -> None:
         "vocal_mix": str(vocals_dir / "vocal_mix.wav"),
         "master": str(out),
         "lead_rms_db": round(rms_db(parts["lead"]), 3),
-        "notes": "Center lead with de-essing/compression, quiet micro-delay doubles, reverb/delay, and light backing ducking.",
+        "notes": "Vocal is score-locked first, then centered/de-essed/compressed with quiet doubles, reverb/delay and light backing ducking.",
     }
     (project / "vocal_mix_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print("✅ Score-locked vocal:", report["score_locked_vocal"])
     print("✅ Vocal lead:", report["lead"])
     print("✅ Vocal mix:", report["vocal_mix"])
     print("✅ Instrumental preserved:", instrumental)
