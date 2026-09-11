@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ def run_optional(cmd: list[str], cwd: Path, label: str) -> tuple[bool, str | Non
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Musicm8 AI producer v7: strict-key composition -> tuning-safe synthesis -> genre mix -> quality-gated neural vocals.")
+    p = argparse.ArgumentParser(description="Musicm8 AI producer v8: strict-key music + score/phoneme-conditioned SoulX lead vocals.")
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--repo", type=Path, default=Path(__file__).resolve().parent)
     p.add_argument("--idea", required=True)
@@ -36,10 +37,11 @@ def main() -> None:
     p.add_argument("--ai-model", default="Qwen/Qwen2.5-1.5B-Instruct")
     p.add_argument("--match-iters", type=int, default=48)
     p.add_argument("--match-seconds", type=float, default=3.0)
-    p.add_argument("--vocal-style", default="expressive contemporary lead vocal, intimate verses, stronger hook, crisp consonants, very clear words")
+    p.add_argument("--vocal-style", default="expressive contemporary lead vocal")
     p.add_argument("--vocal-language", default="en")
-    p.add_argument("--vocal-steps", type=int, default=40)
-    p.add_argument("--lyrics-file", type=Path, default=None, help="Optional exact user-written lyrics. [Verse]/[Chorus] headers supported.")
+    p.add_argument("--vocal-steps", type=int, default=32)
+    p.add_argument("--lyrics-file", type=Path, default=None)
+    p.add_argument("--voice-reference", type=Path, default=None, help="Optional clean authorized voice reference for SoulX-Singer-SVC.")
     p.add_argument("--no-ai", action="store_true")
     p.add_argument("--no-vocals", action="store_true")
     p.add_argument("--skip-sound-match", action="store_true")
@@ -60,13 +62,14 @@ def main() -> None:
     plan = project / "plan.json"
     lyrics_json = project / "lyrics.json"
     lyrics_txt = project / "lyrics.txt"
-    vocal_score = project / "vocal_score.json"
     arrangement = project / "arrangement.mid"
     matched = project / "matched_patches.json"
+    vocal_score = project / "vocal_score.json"
+    vocal_midi = project / "vocal_melody.mid"
     raw_vocal = project / "vocals" / "neural_lead_raw.wav"
-    timed_vocal = project / "vocals" / "neural_lead_timed.wav"
     synced_vocal = project / "vocals" / "neural_lead_synced.wav"
-    vocal_quality = project / "vocals" / "vocal_quality.json"
+    pitch_quality = project / "vocals" / "vocal_quality.json"
+    word_quality = project / "vocals" / "vocal_word_quality.json"
 
     for path in (audio, work, reference_dir, patch_cache, project, raw_vocal.parent):
         path.mkdir(parents=True, exist_ok=True)
@@ -79,7 +82,7 @@ def main() -> None:
     print("GPU:", torch.cuda.get_device_name(0))
     print("Idea:", args.idea)
     print("Song seed:", args.seed)
-    print("Musicm8 v7: strict tuning + safe synthesis + exact phrase timing + vocal pitch QA")
+    print("Musicm8 v8: strict tuning + tuning-safe sound design + score/phoneme-controlled SoulX vocals")
 
     print("\n=== 1/13 ANALYSE REFERENCE SONGS ===")
     cmd = [sys.executable, "-u", "daw_extract.py", "--audio-dir", audio, "--out", dataset, "--device", "cuda"]
@@ -143,46 +146,56 @@ def main() -> None:
         run([sys.executable, "-u", "reference_master.py", "--master", project / "master.wav", "--plan", plan, "--references", library, "--out", project / "master.wav"], repo)
     instrumental = project / "master_instrumental.wav"
     if (project / "master.wav").exists():
-        import shutil
         shutil.copy2(project / "master.wav", instrumental)
 
     vocal_ok = False
     vocal_error = None
     if not args.no_vocals:
-        print("\n=== 10/13 ALIGN LYRICS TO WRITTEN VOCAL MELODY ===")
-        melody = project / "midi_stems" / "melody.mid"
-        if melody.exists():
-            run([sys.executable, "-u", "vocal_score.py", "--plan", plan, "--lyrics", lyrics_json, "--melody-midi", melody, "--out", vocal_score], repo)
-        else:
-            print("⚠️ Melody MIDI missing; vocal score unavailable.")
+        print("\n=== 10/13 BUILD DICTION-FIRST VOCAL SCORE ===")
+        run([
+            sys.executable, "-u", "vocal_lead_score.py",
+            "--plan", plan,
+            "--lyrics", lyrics_json,
+            "--midi-out", vocal_midi,
+            "--score-out", vocal_score,
+        ], repo)
 
-        print("\n=== 11/13 NEURAL SINGING — DICTION MODE ===")
-        for old in (raw_vocal, timed_vocal, synced_vocal):
-            if old.exists():
-                old.unlink()
-        cmd = [sys.executable, "-u", "neural_vocals.py", "--repo", repo, "--root", root, "--backing", instrumental, "--lyrics", lyrics_txt, "--plan", plan, "--out", raw_vocal, "--style", args.vocal_style, "--language", args.vocal_language, "--seed", str(args.seed), "--steps", str(args.vocal_steps)]
-        vocal_ok, vocal_error = run_optional(cmd, repo, "Neural vocal generation")
+        print("\n=== 11/13 SOULX SCORE/PHONEME-CONDITIONED LEAD SINGER ===")
+        for stale in (raw_vocal, synced_vocal):
+            if stale.exists():
+                stale.unlink()
+        cmd = [
+            sys.executable, "-u", "soulx_vocals.py",
+            "--repo", repo,
+            "--root", root,
+            "--score", vocal_score,
+            "--out", raw_vocal,
+            "--svc-steps", str(max(8, min(40, args.vocal_steps))),
+        ]
+        if args.voice_reference is not None:
+            cmd += ["--voice-reference", args.voice_reference]
+        vocal_ok, vocal_error = run_optional(cmd, repo, "SoulX lead vocal generation")
 
-        print("\n=== 12/13 EXACT PHRASE TIMING + SCORE LOCK + PITCH QA ===")
-        if vocal_ok and raw_vocal.exists() and vocal_score.exists():
-            vocal_ok, vocal_error = run_optional([
-                sys.executable, "-u", "vocal_post_v2.py",
-                "--repo", repo,
-                "--raw", raw_vocal,
-                "--score", vocal_score,
-                "--synced", synced_vocal,
-                "--quality-report", vocal_quality,
-            ], repo, "Vocal timing/pitch QA")
+        print("\n=== 12/13 PITCH + WORD INTELLIGIBILITY QA ===")
+        if vocal_ok and raw_vocal.exists():
+            shutil.copy2(raw_vocal, synced_vocal)
+            vocal_ok, vocal_error = run_optional([sys.executable, "-u", "vocal_quality_gate.py", "--vocal", synced_vocal, "--score", vocal_score, "--report", pitch_quality], repo, "Vocal pitch quality gate")
+            if vocal_ok:
+                vocal_ok, vocal_error = run_optional([sys.executable, "-u", "vocal_word_gate.py", "--vocal", synced_vocal, "--lyrics", lyrics_txt, "--report", word_quality], repo, "Vocal word intelligibility gate")
             if not vocal_ok:
-                print("❌ Vocal rejected: timing or pitch still fails the written score. The clean instrumental will be kept instead of mixing a bad singer.")
+                print("❌ Vocal rejected. Musicm8 will keep the clean instrumental rather than mix an off-key or unintelligible lead.")
         else:
-            print("⏭️ No raw vocal/score to post-process.")
+            print("⏭️ No SoulX vocal available for QA.")
 
         print("\n=== 13/13 GENRE VOCAL PROCESSING + FINAL MIX ===")
         if vocal_ok and synced_vocal.exists():
+            if instrumental.exists():
+                shutil.copy2(instrumental, project / "master.wav")
             run([sys.executable, "-u", "mix_vocals.py", "--project", project, "--vocal", synced_vocal, "--plan", plan, "--out", project / "master.wav"], repo)
         else:
-            print("⏭️ Keeping tuning-safe instrumental; no failed/off-key vocal is being mixed.")
+            if instrumental.exists():
+                shutil.copy2(instrumental, project / "master.wav")
+            print("⏭️ Final master is instrumental because the lead vocal did not pass QA.")
 
     lyrics_source = None
     if lyrics_json.exists():
@@ -192,12 +205,12 @@ def main() -> None:
             pass
 
     payload = {
-        "format": "musicm8-ai-project-v7",
+        "format": "musicm8-ai-project-v8",
         "engine": "musicm8-tuning-safe-synth-v3",
         "producer": "ai+genre-production-director",
         "composer": "phrase-aware-genre-v3+tuning-guard-v1",
         "mix_engine": "musicm8-mix-polish-v3+reference-master",
-        "vocal_engine": "ACE-Step-1.5 clarity + phrase timing rebuild + score lock + pitch QA" if not args.no_vocals else None,
+        "vocal_engine": "SoulX-Singer score+phoneme control + optional SoulX-SVC clone + pitch/word QA" if not args.no_vocals else None,
         "idea": args.idea,
         "seed": args.seed,
         "plan": str(plan),
@@ -205,11 +218,13 @@ def main() -> None:
         "lyrics_text": str(lyrics_txt),
         "lyrics_source": lyrics_source,
         "user_lyrics_file": str(args.lyrics_file) if args.lyrics_file else None,
+        "voice_reference": str(args.voice_reference) if args.voice_reference else None,
         "vocal_score": str(vocal_score) if vocal_score.exists() else None,
+        "vocal_melody": str(vocal_midi) if vocal_midi.exists() else None,
         "raw_neural_vocal": str(raw_vocal) if raw_vocal.exists() else None,
-        "timed_neural_vocal": str(timed_vocal) if timed_vocal.exists() else None,
         "synced_neural_vocal": str(synced_vocal) if synced_vocal.exists() else None,
-        "vocal_quality_report": str(vocal_quality) if vocal_quality.exists() else None,
+        "vocal_pitch_quality": str(pitch_quality) if pitch_quality.exists() else None,
+        "vocal_word_quality": str(word_quality) if word_quality.exists() else None,
         "vocal_status": "ok" if vocal_ok else ("disabled" if args.no_vocals else "rejected_or_failed"),
         "vocal_error": vocal_error,
         "reference_library": str(library),
@@ -228,9 +243,10 @@ def main() -> None:
     }
     (project / "project.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    print("\n✅ MUSICM8 AI PRODUCER V7 COMPLETE")
+    print("\n✅ MUSICM8 AI PRODUCER V8 COMPLETE")
     print("Seed:", args.seed)
     print("Lyrics source:", lyrics_source)
+    print("Vocal status:", payload["vocal_status"])
     print("Instrumental:", instrumental)
     print("Final:", project / "master.wav")
     if lyrics_txt.exists():
