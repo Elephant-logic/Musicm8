@@ -2,4 +2,6 @@
 transformers>=4.45,<5.0
 accelerate>=1.0
 sentencepiece>=0.2
+huggingface_hub>=0.30
+anticipation @ git+https://github.com/jthickstun/anticipation.git@af37397922665a0fb8d474d7988b0f3755a38d45
 uv>=0.8
