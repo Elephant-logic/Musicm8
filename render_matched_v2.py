@@ -111,13 +111,41 @@ def render_project(plan_path: Path, midi_path: Path, patches_path: Path, out_dir
     return master
 
 
+def auto_hybridize(plan: Path, midi: Path, out: Path) -> None:
+    """Use the reference library automatically when this is a normal Musicm8 work project.
+
+    The base synth remains the timing/tuning backbone. Short reference-derived drum hits,
+    bass note bodies and chord textures are layered underneath before mix_polish_v3 runs.
+    """
+    try:
+        work = out.parents[1]
+    except Exception:
+        return
+    references = work / "reference_library" / "library.json"
+    bank = work / "reference_instrument_bank.json"
+    if not references.exists():
+        print("⚠️ Hybrid instrument layer skipped: reference library not found")
+        return
+    try:
+        from hybrid_instruments import hybridize
+        report = hybridize(out, plan, references, midi, bank)
+        print("✅ Hybrid reference instruments active")
+        for role, info in report.get("roles", {}).items():
+            print(f"   {role}: {info.get('status')} blend={info.get('blend')} events={info.get('reference_events_used')}")
+    except Exception as exc:
+        # Never destroy a valid synth render if the optional sample layer has a bad reference clip.
+        print(f"⚠️ Hybrid instrument layer failed safely ({exc}); keeping the synth-only stems.")
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Render Musicm8 v2 inverse-matched synth/FX project with genre production controls.")
+    p = argparse.ArgumentParser(description="Render Musicm8 v2 inverse-matched synth/FX project with genre production controls and hybrid reference instruments.")
     p.add_argument("--plan", type=Path, required=True); p.add_argument("--midi", type=Path, required=True); p.add_argument("--patches", type=Path, required=True); p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     master = render_project(args.plan, args.midi, args.patches, args.out)
-    print(f"✅ Musicm8 Synth v2 genre-aware master: {master}")
+    auto_hybridize(args.plan, args.midi, args.out)
+    print(f"✅ Musicm8 Synth v2 + Hybrid Instrument master base: {master}")
     print(f"✅ Audio stems: {args.out / 'audio_stems'}")
+    print("✅ Genre mix stage will now process the hybrid stems")
 
 
 if __name__ == "__main__":
