@@ -61,8 +61,9 @@ def ensure_ace_source(ace_root: Path, log: Path) -> None:
 
 
 def ensure_environment(uv: str, ace_root: Path, env: dict[str, str], log: Path) -> None:
-    # Always sync. It is quick when cached and avoids an old venv becoming incompatible
-    # after ACE-Step changes upstream.
+    # ACE-Step requires Python <3.13. Keep uv's cache + managed Python on Colab's
+    # local filesystem: Google Drive/FUSE does not support all atomic lock/rename
+    # operations uv uses and can raise "Operation not permitted".
     print("Preparing/updating isolated ACE-Step Python 3.12 environment...")
     run([uv, "python", "install", "3.12"], env=env, log=log)
     run([uv, "sync", "--python", "3.12"], cwd=ace_root, env=env, log=log)
@@ -190,8 +191,13 @@ def main() -> None:
 
     work = args.root / "work"
     models_dir = work / "ace_step_models"
-    uv_cache = work / "uv_cache"
     hf_cache = work / "hf_cache"
+
+    # IMPORTANT: uv itself must use /content, not Google Drive. Drive is a FUSE
+    # mount and rejects some lock/temporary-file operations used by uv.
+    uv_cache = Path("/content/musicm8_uv_cache")
+    uv_python = Path("/content/musicm8_uv_python")
+
     log = args.out.parent / "vocal_backend.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("Musicm8 vocal backend log\n", encoding="utf-8")
@@ -199,15 +205,20 @@ def main() -> None:
     uv = ensure_uv()
     ensure_ace_source(args.ace_root, log)
 
-    for path in (models_dir, uv_cache, hf_cache):
+    for path in (models_dir, hf_cache, uv_cache, uv_python):
         path.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
     env["ACESTEP_CHECKPOINTS_DIR"] = str(models_dir)
     env["UV_CACHE_DIR"] = str(uv_cache)
+    env["UV_PYTHON_INSTALL_DIR"] = str(uv_python)
     env["HF_HOME"] = str(hf_cache)
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    print("uv cache (local):", uv_cache)
+    print("uv Python (local):", uv_python)
+    print("ACE-Step models (Drive):", models_dir)
 
     ensure_environment(uv, args.ace_root, env, log)
     ensure_models(uv, args.ace_root, models_dir, env, log)
@@ -217,7 +228,7 @@ def main() -> None:
         raise FileNotFoundError(runner)
 
     status = {
-        "format": "musicm8-vocal-backend-status-v2",
+        "format": "musicm8-vocal-backend-status-v3",
         "backend": "ACE-Step-1.5",
         "primary": "lego-vocals",
         "fallback": "cover-then-demucs-vocals",
@@ -225,6 +236,8 @@ def main() -> None:
         "method": None,
         "errors": [],
         "log": str(log),
+        "uv_cache": str(uv_cache),
+        "uv_python": str(uv_python),
     }
 
     # Primary path: ACE-Step Lego generates the vocals track directly in context.
